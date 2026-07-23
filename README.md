@@ -10,6 +10,7 @@
 - Storage IO raw speed benchmark (sequential/random read and write with IOPS + throughput)
 - Network raw speed benchmark to a target URL
 - JSON output for machine consumption
+- Progress messages on stderr by default (disable with `--quiet`)
 - Category scoring + total score for easy VM/bare-metal comparison
 - Cross-platform Rust implementation (Linux, macOS, Windows; major CPU architectures supported by Rust targets)
 
@@ -77,6 +78,15 @@ JSON output:
 
 ```bash
 cargo run -- --json run --threads 2 --duration 5 --io-path /tmp
+```
+
+Normal terminal output reports benchmark progress on stderr. This keeps stdout
+available for results while showing the active benchmark phase. Use `--quiet`
+to suppress those messages; `--json` also suppresses them so JSON output stays
+machine-readable.
+
+```bash
+cargo run -- --quiet cpu --threads 2 --duration 5
 ```
 
 ## Cross compilation

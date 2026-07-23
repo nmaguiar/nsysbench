@@ -28,6 +28,10 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Suppress progress messages written to stderr
+    #[arg(short, long, global = true)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -224,103 +228,149 @@ struct SuiteResult {
     total_score: f64,
 }
 
+struct Reporter {
+    enabled: bool,
+}
+
+impl Reporter {
+    fn new(enabled: bool) -> Self {
+        Self { enabled }
+    }
+
+    fn status(&self, message: impl std::fmt::Display) {
+        if self.enabled {
+            eprintln!(
+                "{}",
+                format!("nsysbench: {message}").bright_black().italic()
+            );
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    let reporter = Reporter::new(!cli.json && !cli.quiet);
 
     let result = match cli.command {
         Some(Command::Cpu(args)) => {
             if args.sequence {
-                let sequence = bench_cpu_sequence(&args);
+                let sequence = bench_cpu_sequence(&args, &reporter);
                 if cli.json {
                     println!("{}", serde_json::to_string_pretty(&sequence)?);
                 } else {
+                    print_report_separator();
                     print_cpu_sequence(&sequence);
                 }
             } else {
-                let cpu = bench_cpu(&args);
+                let cpu = bench_cpu(&args, &reporter);
                 if cli.json {
                     println!("{}", serde_json::to_string_pretty(&cpu)?);
                 } else {
+                    print_report_separator();
                     print_cpu(&cpu);
                 }
             }
             return Ok(());
         }
         Some(Command::Memory(args)) => {
-            let mem = bench_memory(&args);
+            let mem = bench_memory(&args, &reporter);
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&mem)?);
             } else {
+                print_report_separator();
                 print_memory(&mem);
             }
             return Ok(());
         }
         Some(Command::Io(args)) => {
-            let io = bench_io(&args)?;
+            let io = bench_io(&args, &reporter)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&io)?);
             } else {
+                print_report_separator();
                 print_io(&io);
             }
             return Ok(());
         }
         Some(Command::Network(args)) => {
-            let network = bench_network(&args)?;
+            let network = bench_network(&args, &reporter)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&network)?);
             } else {
+                print_report_separator();
                 print_network(&network);
             }
             return Ok(());
         }
         Some(Command::Info(args)) => {
+            reporter.status(format!(
+                "collecting system information for {}",
+                args.path.display()
+            ));
             let info = system_info(&args.path);
+            reporter.status("system information collected");
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&info)?);
             } else {
+                print_report_separator();
                 print_system_info(&info);
             }
             return Ok(());
         }
-        Some(Command::Run(args)) => run_suite(args)?,
-        None => run_suite(RunArgs::default())?,
+        Some(Command::Run(args)) => run_suite(args, &reporter)?,
+        None => run_suite(RunArgs::default(), &reporter)?,
     };
 
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
+        print_report_separator();
         print_suite(&result);
     }
 
     Ok(())
 }
 
-fn run_suite(args: RunArgs) -> Result<SuiteResult, Box<dyn Error>> {
+fn run_suite(args: RunArgs, reporter: &Reporter) -> Result<SuiteResult, Box<dyn Error>> {
+    reporter.status("starting benchmark suite");
     let threads = args.threads.unwrap_or(1);
-    let cpu = Some(bench_cpu(&CpuArgs {
-        threads,
-        duration: args.duration,
-        sequence: false,
-    }));
+    let cpu = Some(bench_cpu(
+        &CpuArgs {
+            threads,
+            duration: args.duration,
+            sequence: false,
+        },
+        reporter,
+    ));
 
-    let memory = Some(bench_memory(&MemoryArgs {
-        size_mb: args.memory_mb,
-        duration: args.duration.max(4),
-    }));
+    let memory = Some(bench_memory(
+        &MemoryArgs {
+            size_mb: args.memory_mb,
+            duration: args.duration.max(4),
+        },
+        reporter,
+    ));
 
-    let io = Some(bench_io(&IoArgs {
-        path: args.io_path,
-        block_kb: 4,
-        file_size_mb: 64,
-        duration: args.duration.max(4),
-    })?);
+    let io = Some(bench_io(
+        &IoArgs {
+            path: args.io_path,
+            block_kb: 4,
+            file_size_mb: 64,
+            duration: args.duration.max(4),
+        },
+        reporter,
+    )?);
 
     let network = if let Some(target) = args.target {
-        Some(bench_network(&NetworkArgs {
-            target,
-            duration: args.duration,
-        })?)
+        Some(bench_network(
+            &NetworkArgs {
+                target,
+                duration: args.duration,
+            },
+            reporter,
+        )?)
     } else {
+        reporter.status("skipping network benchmark (no target provided)");
         None
     };
 
@@ -331,6 +381,7 @@ fn run_suite(args: RunArgs) -> Result<SuiteResult, Box<dyn Error>> {
         network.as_ref().map(|r| r.score),
     ]);
 
+    reporter.status("benchmark suite completed");
     Ok(SuiteResult {
         cpu,
         memory,
@@ -507,8 +558,12 @@ fn io_info(path: &Path) -> IoInfo {
     info
 }
 
-fn bench_cpu(args: &CpuArgs) -> CpuResult {
+fn bench_cpu(args: &CpuArgs, reporter: &Reporter) -> CpuResult {
     let threads = resolve_threads(args.threads);
+    reporter.status(format!(
+        "running CPU benchmark with {threads} thread(s) for {}s",
+        args.duration.max(1)
+    ));
     let stop = Arc::new(AtomicBool::new(false));
     let total = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
@@ -542,13 +597,15 @@ fn bench_cpu(args: &CpuArgs) -> CpuResult {
     let primes_found = total.load(Ordering::Relaxed);
     let throughput = primes_found as f64 / elapsed;
 
-    CpuResult {
+    let result = CpuResult {
         threads,
         duration_secs: elapsed,
         primes_found,
         throughput_primes_per_sec: throughput,
         score: cpu_score(throughput),
-    }
+    };
+    reporter.status("CPU benchmark completed");
+    result
 }
 
 fn resolve_threads(threads: usize) -> usize {
@@ -559,16 +616,22 @@ fn resolve_threads(threads: usize) -> usize {
     }
 }
 
-fn bench_cpu_sequence(args: &CpuArgs) -> CpuSequenceResult {
+fn bench_cpu_sequence(args: &CpuArgs, reporter: &Reporter) -> CpuSequenceResult {
     let duration = args.duration.max(1);
     let thread_limit = resolve_threads(args.threads);
+    reporter.status(format!(
+        "running CPU scaling benchmark from 1 to {thread_limit} thread(s), {duration}s each"
+    ));
     let results = (1..=thread_limit)
         .map(|threads| {
-            bench_cpu(&CpuArgs {
-                threads,
-                duration,
-                sequence: false,
-            })
+            bench_cpu(
+                &CpuArgs {
+                    threads,
+                    duration,
+                    sequence: false,
+                },
+                reporter,
+            )
         })
         .collect();
 
@@ -578,13 +641,16 @@ fn bench_cpu_sequence(args: &CpuArgs) -> CpuSequenceResult {
     }
 }
 
-fn bench_memory(args: &MemoryArgs) -> MemoryResult {
+fn bench_memory(args: &MemoryArgs, reporter: &Reporter) -> MemoryResult {
     let size_mb = args.size_mb.max(1);
     let elements = (size_mb * 1024 * 1024 / 8).max(1);
     let mut data = vec![0u64; elements];
     let phase_secs = (args.duration.max(4) / 4).max(1);
     let phase = Duration::from_secs(phase_secs);
 
+    reporter.status(format!(
+        "running memory sequential write phase for {phase_secs}s"
+    ));
     let seq_write_bytes = run_for(phase, || {
         let mut bytes = 0u64;
         for (i, cell) in data.iter_mut().enumerate() {
@@ -594,6 +660,9 @@ fn bench_memory(args: &MemoryArgs) -> MemoryResult {
         bytes
     });
 
+    reporter.status(format!(
+        "running memory sequential read phase for {phase_secs}s"
+    ));
     let seq_read_bytes = run_for(phase, || {
         let mut bytes = 0u64;
         let mut checksum = 0u64;
@@ -606,6 +675,9 @@ fn bench_memory(args: &MemoryArgs) -> MemoryResult {
     });
 
     let mut rng = 0x9E3779B97F4A7C15u64;
+    reporter.status(format!(
+        "running memory random write phase for {phase_secs}s"
+    ));
     let rand_write_bytes = run_for(phase, || {
         let mut bytes = 0u64;
         for _ in 0..elements {
@@ -617,6 +689,9 @@ fn bench_memory(args: &MemoryArgs) -> MemoryResult {
         bytes
     });
 
+    reporter.status(format!(
+        "running memory random read phase for {phase_secs}s"
+    ));
     let rand_read_bytes = run_for(phase, || {
         let mut bytes = 0u64;
         let mut checksum = 0u64;
@@ -635,7 +710,7 @@ fn bench_memory(args: &MemoryArgs) -> MemoryResult {
     let rand_write_mb_s = bytes_to_mb_s(rand_write_bytes, phase.as_secs_f64());
     let rand_read_mb_s = bytes_to_mb_s(rand_read_bytes, phase.as_secs_f64());
 
-    MemoryResult {
+    let result = MemoryResult {
         size_mb,
         seq_write_mb_s,
         seq_read_mb_s,
@@ -647,16 +722,24 @@ fn bench_memory(args: &MemoryArgs) -> MemoryResult {
             rand_write_mb_s,
             rand_read_mb_s,
         ),
-    }
+    };
+    reporter.status("memory benchmark completed");
+    result
 }
 
-fn bench_io(args: &IoArgs) -> Result<IoResult, Box<dyn Error>> {
+fn bench_io(args: &IoArgs, reporter: &Reporter) -> Result<IoResult, Box<dyn Error>> {
     fs::create_dir_all(&args.path)?;
 
     let file_path = args
         .path
         .join(format!("nsysbench-io-{}.dat", std::process::id()));
     let phase_secs = (args.duration.max(4) / 4).max(1);
+    reporter.status(format!(
+        "running IO benchmark in {} using {} KiB blocks and a {} MiB file",
+        args.path.display(),
+        args.block_kb.max(1),
+        args.file_size_mb.max(8)
+    ));
 
     let (seq_write_mb_s, seq_write_iops) = run_io_phase(
         &file_path,
@@ -665,6 +748,8 @@ fn bench_io(args: &IoArgs) -> Result<IoResult, Box<dyn Error>> {
         phase_secs,
         true,
         false,
+        "sequential write",
+        reporter,
     )?;
 
     let (seq_read_mb_s, seq_read_iops) = run_io_phase(
@@ -674,6 +759,8 @@ fn bench_io(args: &IoArgs) -> Result<IoResult, Box<dyn Error>> {
         phase_secs,
         false,
         false,
+        "sequential read",
+        reporter,
     )?;
 
     let (rand_write_mb_s, rand_write_iops) = run_io_phase(
@@ -683,6 +770,8 @@ fn bench_io(args: &IoArgs) -> Result<IoResult, Box<dyn Error>> {
         phase_secs,
         true,
         true,
+        "random write",
+        reporter,
     )?;
 
     let (rand_read_mb_s, rand_read_iops) = run_io_phase(
@@ -692,11 +781,13 @@ fn bench_io(args: &IoArgs) -> Result<IoResult, Box<dyn Error>> {
         phase_secs,
         false,
         true,
+        "random read",
+        reporter,
     )?;
 
     let _ = fs::remove_file(&file_path);
 
-    Ok(IoResult {
+    let result = IoResult {
         path: args.path.display().to_string(),
         block_kb: args.block_kb,
         file_size_mb: args.file_size_mb,
@@ -718,7 +809,9 @@ fn bench_io(args: &IoArgs) -> Result<IoResult, Box<dyn Error>> {
             rand_write_iops,
             rand_read_iops,
         ),
-    })
+    };
+    reporter.status("IO benchmark completed");
+    Ok(result)
 }
 
 fn run_io_phase(
@@ -728,6 +821,8 @@ fn run_io_phase(
     seconds: u64,
     write_mode: bool,
     random_mode: bool,
+    phase_name: &str,
+    reporter: &Reporter,
 ) -> Result<(f64, f64), Box<dyn Error>> {
     let block_size = (block_kb.max(1) * 1024) as u64;
     let file_size = (file_size_mb.max(8) * 1024 * 1024) as u64;
@@ -740,6 +835,10 @@ fn run_io_phase(
         .truncate(false)
         .open(file_path)?;
     file.set_len(file_size)?;
+    reporter.status(format!(
+        "running IO {phase_name} phase for {}s",
+        seconds.max(1)
+    ));
 
     let start = Instant::now();
     let end = start + Duration::from_secs(seconds.max(1));
@@ -787,7 +886,12 @@ fn run_io_phase(
     Ok((mb_s, iops))
 }
 
-fn bench_network(args: &NetworkArgs) -> Result<NetworkResult, Box<dyn Error>> {
+fn bench_network(args: &NetworkArgs, reporter: &Reporter) -> Result<NetworkResult, Box<dyn Error>> {
+    reporter.status(format!(
+        "running network benchmark against {} for {}s",
+        args.target,
+        args.duration.max(1)
+    ));
     let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
     let start = Instant::now();
     let end = start + Duration::from_secs(args.duration.max(1));
@@ -815,7 +919,7 @@ fn bench_network(args: &NetworkArgs) -> Result<NetworkResult, Box<dyn Error>> {
     let requests_per_sec = requests as f64 / elapsed;
     let avg_latency_ms = total_latency * 1000.0 / requests as f64;
 
-    Ok(NetworkResult {
+    let result = NetworkResult {
         target: args.target.clone(),
         duration_secs: elapsed,
         requests,
@@ -824,7 +928,9 @@ fn bench_network(args: &NetworkArgs) -> Result<NetworkResult, Box<dyn Error>> {
         requests_per_sec,
         avg_latency_ms,
         score: network_score(throughput_mb_s, requests_per_sec),
-    })
+    };
+    reporter.status("network benchmark completed");
+    Ok(result)
 }
 
 fn bytes_to_mb_s(bytes: u64, seconds: f64) -> f64 {
@@ -903,6 +1009,10 @@ fn total_score(scores: &[Option<f64>]) -> f64 {
     scores.iter().flatten().sum()
 }
 
+fn print_report_separator() {
+    println!("{}", "┄".repeat(62).bright_black());
+}
+
 fn print_suite(result: &SuiteResult) {
     println!(
         "\n{}",
@@ -922,6 +1032,7 @@ fn print_suite(result: &SuiteResult) {
             .bright_blue()
             .bold()
     );
+    println!("\n{}", "");
 
     if let Some(cpu) = &result.cpu {
         print_section(
@@ -995,7 +1106,7 @@ fn print_section(name: &str, score: f64, metrics: &[(&str, f64)]) {
 }
 
 fn print_cpu(cpu: &CpuResult) {
-    println!("{}", "⚙️ CPU benchmark".bright_green().bold());
+    println!("{}", "⚙️  CPU benchmark".bright_green().bold());
     print_section(
         "CPU",
         cpu.score,
@@ -1004,7 +1115,7 @@ fn print_cpu(cpu: &CpuResult) {
 }
 
 fn print_cpu_sequence(sequence: &CpuSequenceResult) {
-    println!("{}", "⚙️ CPU scaling benchmark".bright_green().bold());
+    println!("{}", "⚙️  CPU scaling benchmark".bright_green().bold());
     println!("{}", "");
     println!(
         "  {}",

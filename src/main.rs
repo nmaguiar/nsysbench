@@ -51,6 +51,9 @@ struct CpuArgs {
     /// Duration in seconds
     #[arg(short, long, default_value_t = 5)]
     duration: u64,
+    /// Run one CPU test for every thread count from 1 through --threads
+    #[arg(long)]
+    sequence: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -130,6 +133,12 @@ struct CpuResult {
 }
 
 #[derive(Debug, Serialize)]
+struct CpuSequenceResult {
+    duration_secs_per_test: u64,
+    results: Vec<CpuResult>,
+}
+
+#[derive(Debug, Serialize)]
 struct MemoryResult {
     size_mb: usize,
     seq_write_mb_s: f64,
@@ -190,11 +199,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let result = match cli.command {
         Some(Command::Cpu(args)) => {
-            let cpu = bench_cpu(&args);
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&cpu)?);
+            if args.sequence {
+                let sequence = bench_cpu_sequence(&args);
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&sequence)?);
+                } else {
+                    print_cpu_sequence(&sequence);
+                }
             } else {
-                print_cpu(&cpu);
+                let cpu = bench_cpu(&args);
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&cpu)?);
+                } else {
+                    print_cpu(&cpu);
+                }
             }
             return Ok(());
         }
@@ -243,6 +261,7 @@ fn run_suite(args: RunArgs) -> Result<SuiteResult, Box<dyn Error>> {
     let cpu = Some(bench_cpu(&CpuArgs {
         threads,
         duration: args.duration,
+        sequence: false,
     }));
 
     let memory = Some(bench_memory(&MemoryArgs {
@@ -334,6 +353,24 @@ fn bench_cpu(args: &CpuArgs) -> CpuResult {
         primes_found,
         throughput_primes_per_sec: throughput,
         score: cpu_score(throughput),
+    }
+}
+
+fn bench_cpu_sequence(args: &CpuArgs) -> CpuSequenceResult {
+    let duration = args.duration.max(1);
+    let results = (1..=args.threads.max(1))
+        .map(|threads| {
+            bench_cpu(&CpuArgs {
+                threads,
+                duration,
+                sequence: false,
+            })
+        })
+        .collect();
+
+    CpuSequenceResult {
+        duration_secs_per_test: duration,
+        results,
     }
 }
 
@@ -772,6 +809,90 @@ fn print_cpu(cpu: &CpuResult) {
     );
 }
 
+fn print_cpu_sequence(sequence: &CpuSequenceResult) {
+    println!("{}", "⚙️ CPU scaling benchmark".bright_green().bold());
+    println!(
+        "  {}",
+        format!(
+            "{} test(s), {}s each",
+            sequence.results.len(),
+            sequence.duration_secs_per_test
+        )
+        .bright_white()
+    );
+
+    for result in &sequence.results {
+        println!(
+            "  {:>2} thread{}  {:>12.2} prime/s",
+            result.threads,
+            if result.threads == 1 { " " } else { "s" },
+            result.throughput_primes_per_sec
+        );
+    }
+
+    let values: Vec<f64> = sequence
+        .results
+        .iter()
+        .map(|result| result.throughput_primes_per_sec)
+        .collect();
+    println!("\n  {}", "Prime/s".bright_yellow());
+    for line in sparkline(&values).lines() {
+        println!("  {}", line.bright_cyan());
+    }
+    println!("  {}", "threads".dimmed());
+}
+
+fn sparkline(values: &[f64]) -> String {
+    const HEIGHT: usize = 5;
+    const COLUMN_GAP: &str = "   ";
+
+    let Some(&max) = values
+        .iter()
+        .filter(|value| value.is_finite())
+        .max_by(|a, b| a.total_cmp(b))
+    else {
+        return String::new();
+    };
+
+    let column_width = values.len().max(1).to_string().len().max(1);
+    let heights: Vec<usize> = values
+        .iter()
+        .map(|value| {
+            if max <= 0.0 || !value.is_finite() {
+                0
+            } else {
+                ((value / max) * HEIGHT as f64)
+                    .round()
+                    .clamp(1.0, HEIGHT as f64) as usize
+            }
+        })
+        .collect();
+
+    let mut lines = Vec::with_capacity(HEIGHT + 1);
+    for row in (1..=HEIGHT).rev() {
+        lines.push(
+            heights
+                .iter()
+                .map(|height| {
+                    format!(
+                        "{:^width$}",
+                        if *height >= row { "█" } else { " " },
+                        width = column_width
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(COLUMN_GAP),
+        );
+    }
+    lines.push(
+        (1..=values.len())
+            .map(|thread_count| format!("{thread_count:^width$}", width = column_width))
+            .collect::<Vec<_>>()
+            .join(COLUMN_GAP),
+    );
+    lines.join("\n")
+}
+
 fn print_memory(mem: &MemoryResult) {
     println!("{}", "🧠 Memory benchmark".bright_green().bold());
     print_section(
@@ -841,5 +962,15 @@ mod tests {
     fn memory_score_is_average_based() {
         let score = memory_score(100.0, 200.0, 300.0, 400.0);
         assert!((score - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sparkline_is_five_rows_with_spaced_thread_labels() {
+        let chart = sparkline(&[10.0, 20.0, 30.0]);
+        let lines: Vec<_> = chart.lines().collect();
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines.last(), Some(&"1   2   3"));
+        assert_eq!(lines[0], "        █");
+        assert_eq!(lines[4], "█   █   █");
     }
 }

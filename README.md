@@ -35,6 +35,26 @@ cargo run -- cpu --threads 2 --duration 5
 cargo run -- cpu --threads 8 --duration 5
 ```
 
+Set `--threads 0` to automatically use every logical CPU available to the
+process.
+
+Show the performance-relevant CPU, memory, and storage metadata separately:
+
+```bash
+cargo run -- info --path /tmp
+cargo run -- --json info --path /tmp
+```
+
+Compare CPU scaling from one worker through the requested thread count. Each
+test runs sequentially for the same duration; normal terminal output includes a
+five-row UTF-8 prime/s chart with muted dotted grid lines and three spaces
+between thread counts, while JSON output contains every individual result:
+
+```bash
+cargo run -- cpu --threads 8 --duration 5 --sequence
+cargo run -- --json cpu --threads 8 --duration 5 --sequence
+```
+
 Run only memory benchmark:
 
 ```bash

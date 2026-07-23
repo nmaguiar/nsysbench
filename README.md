@@ -91,16 +91,22 @@ cargo run -- --quiet cpu --threads 2 --duration 5
 
 ## Cross compilation
 
-Use Rust target triples to compile for major OS/architectures, e.g.:
+Use Rust target triples to compile for major OS/architectures. For portable Linux
+release binaries, prefer the statically linked musl targets; these run on older
+glibc systems such as AWS Linux instances and do not require the glibc version
+of the build host:
 
 ```bash
-rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu aarch64-apple-darwin
-cargo build --release --target x86_64-unknown-linux-gnu
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+# Linux: install musl-tools first (for example, apt-get install musl-tools)
+cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 ## Release binaries
 
 The **Release binaries** GitHub Actions workflow builds native release archives for
-Linux, macOS, and Windows on x86_64 and ARM64. Publishing a GitHub release attaches
-all six archives plus `SHA256SUMS` to that release. It can also be run manually from
-the Actions tab; provide the tag of the release to create or update.
+Linux, macOS, and Windows on x86_64 and ARM64. The Linux x86_64 and ARM64
+(AWS Graviton) archives use static musl builds, avoiding runtime glibc version
+requirements. Publishing a GitHub release attaches all six archives plus
+`SHA256SUMS` to that release. It can also be run manually from the Actions tab;
+provide the tag of the release to create or update.

@@ -2,6 +2,9 @@ use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
 use reqwest::blocking::Client;
 use serde::Serialize;
+use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::hint::black_box;
@@ -39,6 +42,8 @@ enum Command {
     Io(IoArgs),
     /// Benchmark network raw speed to a target URL
     Network(NetworkArgs),
+    /// Show hardware and storage metadata useful for comparing benchmark results
+    Info(InfoArgs),
     /// Run a suite of benchmarks and aggregate score
     Run(RunArgs),
 }
@@ -90,6 +95,13 @@ struct NetworkArgs {
     /// Duration in seconds
     #[arg(short, long, default_value_t = 8)]
     duration: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+struct InfoArgs {
+    /// Path or mount point whose storage metadata should be shown
+    #[arg(short, long, default_value = ".")]
+    path: PathBuf,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -177,16 +189,34 @@ struct NetworkResult {
 }
 
 #[derive(Debug, Serialize)]
-struct HostInfo {
-    os: String,
-    arch: String,
+struct CpuInfo {
     logical_cpus: usize,
-    physical_cores_hint: usize,
+    physical_cores: Option<usize>,
+    details: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryInfo {
+    total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct IoInfo {
+    path: String,
+    filesystem: Option<String>,
+    total_bytes: Option<u64>,
+    available_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemInfo {
+    cpu: CpuInfo,
+    memory: MemoryInfo,
+    io: IoInfo,
 }
 
 #[derive(Debug, Serialize)]
 struct SuiteResult {
-    host: HostInfo,
     cpu: Option<CpuResult>,
     memory: Option<MemoryResult>,
     io: Option<IoResult>,
@@ -243,6 +273,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             return Ok(());
         }
+        Some(Command::Info(args)) => {
+            let info = system_info(&args.path);
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&info)?);
+            } else {
+                print_system_info(&info);
+            }
+            return Ok(());
+        }
         Some(Command::Run(args)) => run_suite(args)?,
         None => run_suite(RunArgs::default())?,
     };
@@ -293,7 +332,6 @@ fn run_suite(args: RunArgs) -> Result<SuiteResult, Box<dyn Error>> {
     ]);
 
     Ok(SuiteResult {
-        host: host_info(),
         cpu,
         memory,
         io,
@@ -302,18 +340,175 @@ fn run_suite(args: RunArgs) -> Result<SuiteResult, Box<dyn Error>> {
     })
 }
 
-fn host_info() -> HostInfo {
-    let logical = thread::available_parallelism().map_or(1, usize::from);
-    HostInfo {
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        logical_cpus: logical,
-        physical_cores_hint: logical.max(1) / 2,
+fn system_info(path: &Path) -> SystemInfo {
+    SystemInfo {
+        cpu: cpu_info(),
+        memory: memory_info(),
+        io: io_info(path),
     }
 }
 
+fn cpu_info() -> CpuInfo {
+    let (physical_cores, details) = cpu_details();
+    CpuInfo {
+        logical_cpus: thread::available_parallelism().map_or(1, usize::from),
+        physical_cores,
+        details,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_details() -> (Option<usize>, BTreeMap<String, String>) {
+    let contents = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let mut details: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut physical_cores = BTreeSet::new();
+
+    for processor in contents.split("\n\n") {
+        let fields: BTreeMap<_, _> = processor
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+            .collect();
+        for key in [
+            "model name",
+            "vendor_id",
+            "cpu family",
+            "model",
+            "stepping",
+            "cpu MHz",
+            "cache size",
+        ] {
+            if let Some(value) = fields.get(key) {
+                details
+                    .entry(key.to_string())
+                    .or_default()
+                    .insert(value.clone());
+            }
+        }
+        if let (Some(package), Some(core)) = (fields.get("physical id"), fields.get("core id")) {
+            physical_cores.insert(format!("{package}:{core}"));
+        }
+    }
+
+    (
+        (!physical_cores.is_empty()).then_some(physical_cores.len()),
+        details
+            .into_iter()
+            .map(|(key, values)| (key, values.into_iter().collect::<Vec<_>>().join(", ")))
+            .collect(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_details() -> (Option<usize>, BTreeMap<String, String>) {
+    let output = std::process::Command::new("sysctl").arg("-a").output();
+    let mut details = BTreeMap::new();
+    let mut physical_cores = None;
+
+    if let Ok(output) = output {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = value.trim();
+            if matches!(
+                key,
+                "machdep.cpu.brand_string"
+                    | "machdep.cpu.vendor"
+                    | "machdep.cpu.family"
+                    | "machdep.cpu.model"
+                    | "machdep.cpu.stepping"
+                    | "hw.cpufrequency"
+                    | "hw.tbfrequency"
+                    | "hw.cachelinesize"
+                    | "hw.l1dcachesize"
+                    | "hw.l1icachesize"
+                    | "hw.l2cachesize"
+                    | "hw.l3cachesize"
+                    | "hw.model"
+                    | "hw.machine"
+                    | "hw.machine_arch"
+            ) || key.starts_with("hw.perflevel")
+            {
+                if key == "hw.physicalcpu" {
+                    physical_cores = value.parse().ok();
+                }
+                details.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+
+    (physical_cores, details)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn cpu_details() -> (Option<usize>, BTreeMap<String, String>) {
+    (None, BTreeMap::new())
+}
+
+#[cfg(target_os = "linux")]
+fn memory_info() -> MemoryInfo {
+    let total_bytes = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                line.strip_prefix("MemTotal:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+                    .map(|kilobytes| kilobytes * 1024)
+            })
+        });
+    MemoryInfo { total_bytes }
+}
+
+#[cfg(target_os = "macos")]
+fn memory_info() -> MemoryInfo {
+    let total_bytes = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|value| value.trim().parse().ok());
+    MemoryInfo { total_bytes }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn memory_info() -> MemoryInfo {
+    MemoryInfo { total_bytes: None }
+}
+
+fn io_info(path: &Path) -> IoInfo {
+    let path = path.display().to_string();
+    let mut info = IoInfo {
+        path: path.clone(),
+        filesystem: None,
+        total_bytes: None,
+        available_bytes: None,
+    };
+    let Ok(output) = std::process::Command::new("df")
+        .args(["-kP", &path])
+        .output()
+    else {
+        return info;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = stdout.lines().last() else {
+        return info;
+    };
+    let fields: Vec<_> = line.split_whitespace().collect();
+    if fields.len() >= 4 {
+        info.filesystem = Some(fields[0].to_string());
+        info.total_bytes = fields[1].parse::<u64>().ok().map(|blocks| blocks * 1024);
+        info.available_bytes = fields[3].parse::<u64>().ok().map(|blocks| blocks * 1024);
+    }
+    info
+}
+
 fn bench_cpu(args: &CpuArgs) -> CpuResult {
-    let threads = args.threads.max(1);
+    let threads = resolve_threads(args.threads);
     let stop = Arc::new(AtomicBool::new(false));
     let total = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
@@ -356,9 +551,18 @@ fn bench_cpu(args: &CpuArgs) -> CpuResult {
     }
 }
 
+fn resolve_threads(threads: usize) -> usize {
+    if threads == 0 {
+        thread::available_parallelism().map_or(1, usize::from)
+    } else {
+        threads
+    }
+}
+
 fn bench_cpu_sequence(args: &CpuArgs) -> CpuSequenceResult {
     let duration = args.duration.max(1);
-    let results = (1..=args.threads.max(1))
+    let thread_limit = resolve_threads(args.threads);
+    let results = (1..=thread_limit)
         .map(|threads| {
             bench_cpu(&CpuArgs {
                 threads,
@@ -719,16 +923,6 @@ fn print_suite(result: &SuiteResult) {
             .bold()
     );
 
-    println!(
-        "{} {}  {} {}  {} {}",
-        "🖥️".bright_cyan(),
-        format!("OS: {}", result.host.os).white(),
-        "🧬".bright_cyan(),
-        format!("ARCH: {}", result.host.arch).white(),
-        "🧵".bright_cyan(),
-        format!("LOGICAL CPU: {}", result.host.logical_cpus).white()
-    );
-
     if let Some(cpu) = &result.cpu {
         print_section(
             "CPU",
@@ -811,6 +1005,7 @@ fn print_cpu(cpu: &CpuResult) {
 
 fn print_cpu_sequence(sequence: &CpuSequenceResult) {
     println!("{}", "⚙️ CPU scaling benchmark".bright_green().bold());
+    println!("{}", "");
     println!(
         "  {}",
         format!(
@@ -837,14 +1032,55 @@ fn print_cpu_sequence(sequence: &CpuSequenceResult) {
         .collect();
     println!("\n  {}", "Prime/s".bright_yellow());
     for line in sparkline(&values).lines() {
-        println!("  {}", line.bright_cyan());
+        println!("  {}", color_chart_line(line));
     }
     println!("  {}", "threads".dimmed());
 }
 
+fn print_system_info(info: &SystemInfo) {
+    println!("{}", "ℹ️ System performance metadata".bright_green().bold());
+    println!("\n{}", "CPU".bright_cyan().bold());
+    println!(
+        "  Logical CPUs: {}  Physical cores: {}",
+        info.cpu.logical_cpus,
+        info.cpu
+            .physical_cores
+            .map_or_else(|| "unknown".to_string(), |cores| cores.to_string())
+    );
+    for (key, value) in &info.cpu.details {
+        println!("  {key}: {value}");
+    }
+    println!("\n{}", "Memory".bright_cyan().bold());
+    println!(
+        "  Total: {}",
+        info.memory
+            .total_bytes
+            .map_or_else(|| "unknown".to_string(), format_bytes)
+    );
+    println!("\n{}", "Storage".bright_cyan().bold());
+    println!("  Path: {}", info.io.path);
+    println!(
+        "  Filesystem: {}",
+        info.io.filesystem.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  Capacity: {}  Available: {}",
+        info.io
+            .total_bytes
+            .map_or_else(|| "unknown".to_string(), format_bytes),
+        info.io
+            .available_bytes
+            .map_or_else(|| "unknown".to_string(), format_bytes)
+    );
+}
+
+fn format_bytes(bytes: u64) -> String {
+    format!("{:.2} GiB", bytes as f64 / 1024_f64.powi(3))
+}
+
 fn sparkline(values: &[f64]) -> String {
     const HEIGHT: usize = 5;
-    const COLUMN_GAP: &str = "   ";
+    const COLUMN_GAP: &str = "┄┄┄";
 
     let Some(&max) = values
         .iter()
@@ -876,7 +1112,7 @@ fn sparkline(values: &[f64]) -> String {
                 .map(|height| {
                     format!(
                         "{:^width$}",
-                        if *height >= row { "█" } else { " " },
+                        if *height >= row { "█" } else { "┄" },
                         width = column_width
                     )
                 })
@@ -888,9 +1124,19 @@ fn sparkline(values: &[f64]) -> String {
         (1..=values.len())
             .map(|thread_count| format!("{thread_count:^width$}", width = column_width))
             .collect::<Vec<_>>()
-            .join(COLUMN_GAP),
+            .join("   "),
     );
     lines.join("\n")
+}
+
+fn color_chart_line(line: &str) -> String {
+    line.chars()
+        .map(|character| match character {
+            '█' => character.to_string().bright_cyan().to_string(),
+            '┄' => character.to_string().bright_black().to_string(),
+            _ => character.to_string(),
+        })
+        .collect()
 }
 
 fn print_memory(mem: &MemoryResult) {
@@ -965,12 +1211,25 @@ mod tests {
     }
 
     #[test]
-    fn sparkline_is_five_rows_with_spaced_thread_labels() {
+    fn sparkline_is_five_rows_with_dotted_grid_and_spaced_thread_labels() {
         let chart = sparkline(&[10.0, 20.0, 30.0]);
         let lines: Vec<_> = chart.lines().collect();
         assert_eq!(lines.len(), 6);
         assert_eq!(lines.last(), Some(&"1   2   3"));
-        assert_eq!(lines[0], "        █");
-        assert_eq!(lines[4], "█   █   █");
+        assert_eq!(lines[0], "┄┄┄┄┄┄┄┄█");
+        assert_eq!(lines[4], "█┄┄┄█┄┄┄█");
+    }
+
+    #[test]
+    fn zero_threads_resolves_to_available_logical_cpus() {
+        assert_eq!(
+            resolve_threads(0),
+            thread::available_parallelism().map_or(1, usize::from)
+        );
+    }
+
+    #[test]
+    fn non_zero_threads_are_preserved() {
+        assert_eq!(resolve_threads(3), 3);
     }
 }

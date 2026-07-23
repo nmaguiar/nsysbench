@@ -2,18 +2,13 @@ use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
 use reqwest::blocking::Client;
 use serde::Serialize;
-use std::collections::BTreeMap;
-#[cfg(target_os = "linux")]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::hint::black_box;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,7 +33,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Benchmark CPU raw speed using prime throughput
+    /// Benchmark CPU raw processing performance and topology scaling
     Cpu(CpuArgs),
     /// Benchmark memory read/write raw speed
     Memory(MemoryArgs),
@@ -54,13 +49,13 @@ enum Command {
 
 #[derive(Args, Debug, Clone)]
 struct CpuArgs {
-    /// Number of worker threads (1, 2, or any custom number)
-    #[arg(short, long, default_value_t = 1)]
+    /// Worker-thread limit (0 uses every processor available to this process)
+    #[arg(short, long, default_value_t = 0)]
     threads: usize,
-    /// Duration in seconds
-    #[arg(short, long, default_value_t = 5)]
+    /// Measured seconds per topology stage
+    #[arg(short, long, default_value_t = 8)]
     duration: u64,
-    /// Run one CPU test for every thread count from 1 through --threads
+    /// Run every thread count from 1 through --threads instead of topology checkpoints
     #[arg(long)]
     sequence: bool,
 }
@@ -130,7 +125,7 @@ struct RunArgs {
 impl Default for RunArgs {
     fn default() -> Self {
         Self {
-            threads: Some(1),
+            threads: Some(0),
             duration: 5,
             memory_mb: 128,
             io_path: PathBuf::from("."),
@@ -141,17 +136,74 @@ impl Default for RunArgs {
 
 #[derive(Debug, Serialize)]
 struct CpuResult {
-    threads: usize,
-    duration_secs: f64,
-    primes_found: u64,
-    throughput_primes_per_sec: f64,
+    score_version: u8,
+    requested_threads: usize,
+    topology: CpuTopology,
+    capabilities: CpuCapabilities,
+    stages: Vec<CpuStageResult>,
+    single_thread_score: f64,
+    multi_thread_score: f64,
+    smt_gain_percent: Option<f64>,
+    performance_efficiency_ratio: Option<f64>,
     score: f64,
 }
 
 #[derive(Debug, Serialize)]
 struct CpuSequenceResult {
-    duration_secs_per_test: u64,
-    results: Vec<CpuResult>,
+    score_version: u8,
+    duration_secs_per_stage: u64,
+    topology: CpuTopology,
+    capabilities: CpuCapabilities,
+    results: Vec<CpuStageResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CpuTopology {
+    logical_cpus: Vec<usize>,
+    physical_cores: usize,
+    smt_threads_per_core: usize,
+    core_classes: Vec<CpuCoreClass>,
+    source: String,
+    #[serde(skip)]
+    core_groups: Vec<Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CpuCoreClass {
+    id: String,
+    logical_cpus: Vec<usize>,
+    physical_cores: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CpuCapabilities {
+    placement: String,
+    topology_detail: bool,
+    simd_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CpuStageResult {
+    id: String,
+    threads: usize,
+    cpu_class: Option<String>,
+    placement: String,
+    logical_cpus: Vec<usize>,
+    workloads: Vec<CpuWorkloadResult>,
+    composite_gops: f64,
+    score: f64,
+    scaling_factor: f64,
+    parallel_efficiency_percent: f64,
+    stability_warning: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CpuWorkloadResult {
+    name: String,
+    operations_per_sec: f64,
+    min_operations_per_sec: f64,
+    max_operations_per_sec: f64,
+    coefficient_of_variation_percent: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -400,10 +452,28 @@ fn system_info(path: &Path) -> SystemInfo {
 }
 
 fn cpu_info() -> CpuInfo {
-    let (physical_cores, details) = cpu_details();
+    let topology = cpu_topology();
+    let (reported_physical_cores, mut details) = cpu_details();
+    details.insert("topology source".to_string(), topology.source.clone());
+    details.insert(
+        "core classes".to_string(),
+        topology
+            .core_classes
+            .iter()
+            .map(|class| {
+                format!(
+                    "{}: {} logical / {} physical",
+                    class.id,
+                    class.logical_cpus.len(),
+                    class.physical_cores
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
     CpuInfo {
-        logical_cpus: thread::available_parallelism().map_or(1, usize::from),
-        physical_cores,
+        logical_cpus: topology.logical_cpus.len(),
+        physical_cores: reported_physical_cores.or(Some(topology.physical_cores)),
         details,
     }
 }
@@ -480,6 +550,8 @@ fn cpu_details() -> (Option<usize>, BTreeMap<String, String>) {
                     | "hw.model"
                     | "hw.machine"
                     | "hw.machine_arch"
+                    | "hw.physicalcpu"
+                    | "hw.logicalcpu"
             ) || key.starts_with("hw.perflevel")
             {
                 if key == "hw.physicalcpu" {
@@ -559,86 +631,722 @@ fn io_info(path: &Path) -> IoInfo {
 }
 
 fn bench_cpu(args: &CpuArgs, reporter: &Reporter) -> CpuResult {
-    let threads = resolve_threads(args.threads);
+    let topology = cpu_topology();
+    let capabilities = cpu_capabilities(&topology);
+    let selected = select_cpus(&topology, args.threads);
+    let stages = topology_stages(&topology, &selected);
     reporter.status(format!(
-        "running CPU benchmark with {threads} thread(s) for {}s",
+        "running CPU score v2: {} topology stage(s), {}s each",
+        stages.len(),
         args.duration.max(1)
     ));
-    let stop = Arc::new(AtomicBool::new(false));
-    let total = Arc::new(AtomicU64::new(0));
-    let start = Instant::now();
 
-    let mut handles = Vec::with_capacity(threads);
-    for worker in 0..threads {
-        let stop = Arc::clone(&stop);
-        let total = Arc::clone(&total);
-        handles.push(thread::spawn(move || {
-            let mut local = 0u64;
-            let mut n = 3 + (worker as u64 * 2);
-            let step = (threads as u64) * 2;
-            while !stop.load(Ordering::Relaxed) {
-                if is_prime(n) {
-                    local += 1;
-                }
-                n = n.saturating_add(step);
-            }
-            total.fetch_add(local, Ordering::Relaxed);
-        }));
+    let mut results = Vec::with_capacity(stages.len());
+    for stage in stages {
+        reporter.status(format!(
+            "running CPU stage {} with {} thread(s)",
+            stage.id,
+            stage.cpus.len()
+        ));
+        results.push(run_cpu_stage(&stage, args.duration.max(1), &capabilities));
     }
 
-    thread::sleep(Duration::from_secs(args.duration.max(1)));
-    stop.store(true, Ordering::Relaxed);
-
-    for handle in handles {
-        let _ = handle.join();
+    let single = results
+        .iter()
+        .find(|stage| stage.threads == 1)
+        .map_or(0.0, |stage| stage.composite_gops);
+    for stage in &mut results {
+        stage.scaling_factor = if single > 0.0 {
+            stage.composite_gops / single
+        } else {
+            0.0
+        };
+        stage.parallel_efficiency_percent = if stage.threads > 0 {
+            stage.scaling_factor / stage.threads as f64 * 100.0
+        } else {
+            0.0
+        };
     }
+    let multi = results
+        .iter()
+        .find(|stage| stage.id == "all-logical")
+        .or_else(|| results.last())
+        .map_or(0.0, |stage| stage.composite_gops);
+    let physical = results
+        .iter()
+        .find(|stage| stage.id == "physical-cores")
+        .map(|stage| stage.composite_gops);
+    let smt_gain_percent = physical
+        .filter(|value| *value > 0.0)
+        .map(|value| (multi / value - 1.0) * 100.0);
+    let performance_efficiency_ratio = class_ratio(&results);
+    let score = cpu_score_v2(single, multi);
+    reporter.status("CPU score v2 completed");
 
-    let elapsed = start.elapsed().as_secs_f64();
-    let primes_found = total.load(Ordering::Relaxed);
-    let throughput = primes_found as f64 / elapsed;
-
-    let result = CpuResult {
-        threads,
-        duration_secs: elapsed,
-        primes_found,
-        throughput_primes_per_sec: throughput,
-        score: cpu_score(throughput),
-    };
-    reporter.status("CPU benchmark completed");
-    result
-}
-
-fn resolve_threads(threads: usize) -> usize {
-    if threads == 0 {
-        thread::available_parallelism().map_or(1, usize::from)
-    } else {
-        threads
+    CpuResult {
+        score_version: 2,
+        requested_threads: args.threads,
+        topology,
+        capabilities,
+        stages: results,
+        single_thread_score: single * 100.0,
+        multi_thread_score: multi * 100.0,
+        smt_gain_percent,
+        performance_efficiency_ratio,
+        score,
     }
 }
 
 fn bench_cpu_sequence(args: &CpuArgs, reporter: &Reporter) -> CpuSequenceResult {
+    let topology = cpu_topology();
+    let capabilities = cpu_capabilities(&topology);
+    let selected = select_cpus(&topology, args.threads);
     let duration = args.duration.max(1);
-    let thread_limit = resolve_threads(args.threads);
     reporter.status(format!(
-        "running CPU scaling benchmark from 1 to {thread_limit} thread(s), {duration}s each"
+        "running full CPU scaling sequence from 1 to {} thread(s), {duration}s each",
+        selected.len()
     ));
-    let results = (1..=thread_limit)
-        .map(|threads| {
-            bench_cpu(
-                &CpuArgs {
-                    threads,
-                    duration,
-                    sequence: false,
-                },
-                reporter,
-            )
+    let mut results: Vec<_> = (1..=selected.len())
+        .map(|count| CpuStage {
+            id: format!("threads-{count}"),
+            cpu_class: None,
+            cpus: selected[..count].to_vec(),
         })
+        .map(|stage| run_cpu_stage(&stage, duration, &capabilities))
         .collect();
-
+    let single = results.first().map_or(0.0, |stage| stage.composite_gops);
+    for stage in &mut results {
+        stage.scaling_factor = if single > 0.0 {
+            stage.composite_gops / single
+        } else {
+            0.0
+        };
+        stage.parallel_efficiency_percent = if stage.threads > 0 {
+            stage.scaling_factor / stage.threads as f64 * 100.0
+        } else {
+            0.0
+        };
+    }
     CpuSequenceResult {
-        duration_secs_per_test: duration,
+        score_version: 2,
+        duration_secs_per_stage: duration,
+        topology,
+        capabilities,
         results,
     }
+}
+
+#[derive(Debug, Clone)]
+struct CpuStage {
+    id: String,
+    cpu_class: Option<String>,
+    cpus: Vec<usize>,
+}
+
+fn cpu_topology() -> CpuTopology {
+    #[cfg(target_os = "linux")]
+    {
+        linux_cpu_topology()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_cpu_topology()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        fallback_cpu_topology("scheduler-visible logical CPUs")
+    }
+}
+
+#[allow(dead_code)]
+fn fallback_cpu_topology(source: &str) -> CpuTopology {
+    let logical_cpus: Vec<_> =
+        (0..thread::available_parallelism().map_or(1, usize::from)).collect();
+    CpuTopology {
+        physical_cores: logical_cpus.len(),
+        smt_threads_per_core: 1,
+        core_classes: vec![CpuCoreClass {
+            id: "default".to_string(),
+            logical_cpus: logical_cpus.clone(),
+            physical_cores: logical_cpus.len(),
+        }],
+        logical_cpus: logical_cpus.clone(),
+        source: source.to_string(),
+        core_groups: logical_cpus.iter().map(|cpu| vec![*cpu]).collect(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cpu_topology() -> CpuTopology {
+    let allowed = linux_allowed_cpus();
+    let mut cores: BTreeMap<Vec<usize>, (String, Vec<usize>)> = BTreeMap::new();
+    for cpu in &allowed {
+        let root = format!("/sys/devices/system/cpu/cpu{cpu}");
+        let siblings = fs::read_to_string(format!("{root}/topology/core_cpus_list"))
+            .ok()
+            .map(|value| parse_cpu_list(&value))
+            .filter(|cpus| !cpus.is_empty())
+            .unwrap_or_else(|| vec![*cpu]);
+        let key: Vec<_> = siblings
+            .into_iter()
+            .filter(|candidate| allowed.contains(candidate))
+            .collect();
+        let class = fs::read_to_string(format!("{root}/topology/core_type"))
+            .ok()
+            .map(|value| linux_core_type_name(value.trim()))
+            .or_else(|| {
+                fs::read_to_string(format!("{root}/cpu_capacity"))
+                    .ok()
+                    .map(|v| format!("capacity-{}", v.trim()))
+            })
+            .unwrap_or_else(|| "default".to_string());
+        cores.entry(key.clone()).or_insert((class, key));
+    }
+    normalize_linux_capacity_classes(&mut cores);
+    let core_groups: Vec<_> = cores.values().map(|(_, cpus)| cpus.clone()).collect();
+    let physical_cores = core_groups.len().max(1);
+    let smt_threads_per_core = allowed.len().div_ceil(physical_cores);
+    let mut class_cpus: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut class_cores: BTreeMap<String, usize> = BTreeMap::new();
+    for (class, cpus) in cores.values() {
+        class_cpus.entry(class.clone()).or_default().extend(cpus);
+        *class_cores.entry(class.clone()).or_default() += 1;
+    }
+    CpuTopology {
+        logical_cpus: allowed,
+        physical_cores,
+        smt_threads_per_core,
+        core_classes: class_cpus
+            .into_iter()
+            .map(|(id, logical_cpus)| CpuCoreClass {
+                physical_cores: class_cores[&id],
+                id,
+                logical_cpus,
+            })
+            .collect(),
+        source: "Linux sysfs topology intersected with sched_getaffinity".to_string(),
+        core_groups,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_core_type_name(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "atom" | "32" | "0x20" => "efficiency".to_string(),
+        "core" | "64" | "0x40" => "performance".to_string(),
+        other => format!("core-type-{other}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_linux_capacity_classes(cores: &mut BTreeMap<Vec<usize>, (String, Vec<usize>)>) {
+    let mut capacities: Vec<_> = cores
+        .values()
+        .filter_map(|(class, _)| class.strip_prefix("capacity-")?.parse::<u64>().ok())
+        .collect();
+    capacities.sort_unstable();
+    capacities.dedup();
+    if capacities.len() < 2 {
+        return;
+    }
+    let lowest = capacities[0];
+    let highest = *capacities.last().unwrap_or(&lowest);
+    for (class, _) in cores.values_mut() {
+        if let Some(capacity) = class
+            .strip_prefix("capacity-")
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            *class = if capacity == lowest {
+                "efficiency".to_string()
+            } else if capacity == highest {
+                "performance".to_string()
+            } else {
+                format!("capacity-{capacity}")
+            };
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_allowed_cpus() -> Vec<usize> {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+            let cpus: Vec<_> = (0..libc::CPU_SETSIZE as usize)
+                .filter(|cpu| libc::CPU_ISSET(*cpu, &set))
+                .collect();
+            if !cpus.is_empty() {
+                return cpus;
+            }
+        }
+    }
+    (0..thread::available_parallelism().map_or(1, usize::from)).collect()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cpu_topology() -> CpuTopology {
+    let logical = sysctl_usize("hw.logicalcpu")
+        .unwrap_or_else(|| thread::available_parallelism().map_or(1, usize::from));
+    let physical = sysctl_usize("hw.physicalcpu").unwrap_or(logical);
+    let performance = sysctl_usize("hw.perflevel0.logicalcpu").unwrap_or(logical);
+    let efficiency = sysctl_usize("hw.perflevel1.logicalcpu").unwrap_or(0);
+    let logical_cpus: Vec<_> = (0..logical).collect();
+    let mut classes = vec![CpuCoreClass {
+        id: "performance".to_string(),
+        logical_cpus: (0..performance.min(logical)).collect(),
+        physical_cores: performance.min(physical),
+    }];
+    if efficiency > 0 && performance < logical {
+        classes.push(CpuCoreClass {
+            id: "efficiency".to_string(),
+            logical_cpus: (performance..logical).collect(),
+            physical_cores: efficiency.min(physical.saturating_sub(performance)),
+        });
+    }
+    CpuTopology {
+        logical_cpus,
+        physical_cores: physical,
+        smt_threads_per_core: logical.div_ceil(physical.max(1)),
+        core_classes: classes,
+        source: "macOS sysctl perflevel topology; placement is QoS advisory".to_string(),
+        core_groups: (0..logical).map(|cpu| vec![cpu]).collect(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_usize(name: &str) -> Option<usize> {
+    std::process::Command::new("sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|value| value.trim().parse().ok())
+}
+
+#[allow(dead_code)]
+fn parse_cpu_list(value: &str) -> Vec<usize> {
+    value
+        .trim()
+        .split(',')
+        .flat_map(|part| {
+            let part = part.trim();
+            match part.split_once('-') {
+                Some((start, end)) => start
+                    .parse::<usize>()
+                    .ok()
+                    .zip(end.parse::<usize>().ok())
+                    .map_or_else(Vec::new, |(start, end)| (start..=end).collect()),
+                None => part.parse().ok().into_iter().collect(),
+            }
+        })
+        .collect()
+}
+
+fn cpu_capabilities(topology: &CpuTopology) -> CpuCapabilities {
+    CpuCapabilities {
+        placement: placement_name(),
+        topology_detail: topology.source.contains("sysfs") || topology.source.contains("sysctl"),
+        simd_path: simd_path().to_string(),
+    }
+}
+
+fn placement_name() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        return "pinned".to_string();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return "qos-advisory".to_string();
+    }
+    #[allow(unreachable_code)]
+    "scheduler".to_string()
+}
+
+fn select_cpus(topology: &CpuTopology, requested: usize) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for class in &topology.core_classes {
+        for cpu in &class.logical_cpus {
+            if !cpus.contains(cpu) {
+                cpus.push(*cpu);
+            }
+        }
+    }
+    if cpus.is_empty() {
+        cpus = topology.logical_cpus.clone();
+    }
+    let limit = if requested == 0 {
+        cpus.len()
+    } else {
+        requested.min(cpus.len()).max(1)
+    };
+    cpus.truncate(limit);
+    cpus
+}
+
+fn topology_stages(topology: &CpuTopology, selected: &[usize]) -> Vec<CpuStage> {
+    let mut stages = vec![CpuStage {
+        id: "single-thread".to_string(),
+        cpu_class: None,
+        cpus: selected[..1].to_vec(),
+    }];
+    for class in &topology.core_classes {
+        let cpus: Vec<_> = class
+            .logical_cpus
+            .iter()
+            .copied()
+            .filter(|cpu| selected.contains(cpu))
+            .collect();
+        if cpus.len() > 1 && cpus.len() < selected.len() {
+            stages.push(CpuStage {
+                id: format!("{}-cores", class.id),
+                cpu_class: Some(class.id.clone()),
+                cpus,
+            });
+        }
+    }
+    let physical: Vec<_> = topology
+        .core_classes
+        .iter()
+        .flat_map(|class| class.logical_cpus.iter().copied())
+        .filter(|cpu| selected.contains(cpu))
+        .collect::<Vec<_>>();
+    let mut one_per_core = Vec::new();
+    let mut seen = BTreeSet::new();
+    for cpu in physical {
+        let key = core_key(topology, cpu);
+        if seen.insert(key) {
+            one_per_core.push(cpu);
+        }
+    }
+    if one_per_core.len() > 1 && one_per_core.len() < selected.len() {
+        stages.push(CpuStage {
+            id: "physical-cores".to_string(),
+            cpu_class: None,
+            cpus: one_per_core,
+        });
+    }
+    if selected.len() > 1 {
+        stages.push(CpuStage {
+            id: "all-logical".to_string(),
+            cpu_class: None,
+            cpus: selected.to_vec(),
+        });
+    }
+    stages
+}
+
+fn core_key(topology: &CpuTopology, cpu: usize) -> usize {
+    topology
+        .core_groups
+        .iter()
+        .position(|group| group.contains(&cpu))
+        .unwrap_or(cpu)
+}
+
+#[derive(Clone, Copy)]
+enum CpuWorkload {
+    Integer,
+    FloatingPoint,
+    Simd,
+}
+
+impl CpuWorkload {
+    const ALL: [Self; 3] = [Self::Integer, Self::FloatingPoint, Self::Simd];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Integer => "scalar-integer",
+            Self::FloatingPoint => "scalar-fp",
+            Self::Simd => "simd-fp",
+        }
+    }
+
+    fn run_block(self, seed: u64) -> u64 {
+        match self {
+            Self::Integer => integer_block(seed),
+            Self::FloatingPoint => floating_point_block(seed),
+            Self::Simd => simd_block(seed),
+        }
+    }
+}
+
+fn run_cpu_stage(
+    stage: &CpuStage,
+    duration_secs: u64,
+    capabilities: &CpuCapabilities,
+) -> CpuStageResult {
+    let samples_per_workload = 3usize;
+    let sample_duration = Duration::from_secs_f64(
+        (duration_secs as f64 / (CpuWorkload::ALL.len() * samples_per_workload) as f64).max(0.05),
+    );
+    let mut workloads = Vec::new();
+    for workload in CpuWorkload::ALL {
+        let mut samples = Vec::with_capacity(samples_per_workload);
+        let _ = run_parallel_workload(stage, workload, Duration::from_millis(30), capabilities);
+        for _ in 0..samples_per_workload {
+            samples.push(run_parallel_workload(
+                stage,
+                workload,
+                sample_duration,
+                capabilities,
+            ));
+        }
+        samples.sort_by(f64::total_cmp);
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let variance = samples
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / samples.len() as f64;
+        workloads.push(CpuWorkloadResult {
+            name: workload.name().to_string(),
+            operations_per_sec: samples[samples.len() / 2],
+            min_operations_per_sec: samples[0],
+            max_operations_per_sec: samples[samples.len() - 1],
+            coefficient_of_variation_percent: if mean > 0.0 {
+                variance.sqrt() / mean * 100.0
+            } else {
+                0.0
+            },
+        });
+    }
+    let composite_gops = geometric_mean(
+        workloads
+            .iter()
+            .map(|result| result.operations_per_sec / 1e9),
+    );
+    let max_cv = workloads
+        .iter()
+        .map(|result| result.coefficient_of_variation_percent)
+        .fold(0.0, f64::max);
+    let stability_warning = (max_cv > 5.0).then(|| format!("high sample variation ({max_cv:.1}%)"));
+    CpuStageResult {
+        id: stage.id.clone(),
+        threads: stage.cpus.len(),
+        cpu_class: stage.cpu_class.clone(),
+        placement: capabilities.placement.clone(),
+        logical_cpus: stage.cpus.clone(),
+        workloads,
+        composite_gops,
+        score: composite_gops * 100.0,
+        scaling_factor: 0.0,
+        parallel_efficiency_percent: 0.0,
+        stability_warning,
+    }
+}
+
+fn run_parallel_workload(
+    stage: &CpuStage,
+    workload: CpuWorkload,
+    duration: Duration,
+    capabilities: &CpuCapabilities,
+) -> f64 {
+    let barrier = Arc::new(Barrier::new(stage.cpus.len() + 1));
+    let mut handles = Vec::with_capacity(stage.cpus.len());
+    for (worker, cpu) in stage.cpus.iter().copied().enumerate() {
+        let barrier = Arc::clone(&barrier);
+        let class = stage.cpu_class.clone();
+        let placement = capabilities.placement.clone();
+        handles.push(thread::spawn(move || {
+            apply_worker_placement(cpu, class.as_deref(), &placement);
+            barrier.wait();
+            let end = Instant::now() + duration;
+            let mut seed = (worker as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut operations = 0u64;
+            while Instant::now() < end {
+                operations = operations.saturating_add(workload.run_block(seed));
+                seed = seed.wrapping_add(0xD1B5_4A32_D192_ED03);
+            }
+            black_box(seed);
+            operations
+        }));
+    }
+    let start = Instant::now();
+    barrier.wait();
+    let operations = handles
+        .into_iter()
+        .filter_map(|handle| handle.join().ok())
+        .sum::<u64>();
+    operations as f64 / start.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)
+}
+
+fn apply_worker_placement(cpu: usize, class: Option<&str>, placement: &str) {
+    #[cfg(target_os = "linux")]
+    if placement == "pinned" {
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(cpu, &mut set);
+            let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if placement == "qos-advisory" {
+        let qos = if class == Some("efficiency") {
+            libc::qos_class_t::QOS_CLASS_BACKGROUND
+        } else {
+            libc::qos_class_t::QOS_CLASS_USER_INITIATED
+        };
+        unsafe {
+            let _ = libc::pthread_set_qos_class_self_np(qos, 0);
+        }
+    }
+    let _ = (cpu, class);
+}
+
+fn integer_block(seed: u64) -> u64 {
+    let mut a = seed;
+    let mut b = seed.rotate_left(17);
+    let mut c = !seed;
+    let mut d = seed.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    for _ in 0..20_000 {
+        a = a.wrapping_mul(0x9E37_79B1).rotate_left(13) ^ b;
+        b = b.wrapping_add(0xC2B2_AE3D).rotate_right(11) ^ c;
+        c = c.wrapping_mul(0x1656_67B1).rotate_left(7) ^ d;
+        d = d.wrapping_add(a).rotate_right(19) ^ b;
+    }
+    black_box((a, b, c, d));
+    20_000 * 12
+}
+
+fn floating_point_block(seed: u64) -> u64 {
+    let mut a = seed as f64 * 1e-12 + 1.0;
+    let mut b = a + 0.25;
+    let mut c = a + 0.5;
+    let mut d = a + 0.75;
+    for _ in 0..20_000 {
+        a = a * 1.000_000_1 + b * 0.000_000_1;
+        b = b * 0.999_999_9 + c * 0.000_000_2;
+        c = c * 1.000_000_2 + d * 0.000_000_1;
+        d = d * 0.999_999_8 + a * 0.000_000_3;
+    }
+    black_box((a, b, c, d));
+    20_000 * 12
+}
+
+fn simd_block(seed: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            return simd_avx2_fma_block(seed);
+        }
+        if std::arch::is_x86_feature_detected!("sse2") {
+            return simd_sse2_block(seed);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return simd_neon_block(seed);
+    }
+    #[allow(unreachable_code)]
+    simd_scalar_block(seed)
+}
+
+fn simd_scalar_block(seed: u64) -> u64 {
+    let mut lanes = [seed as f32 * 1e-6 + 1.0, 1.25, 1.5, 1.75];
+    for _ in 0..20_000 {
+        for lane in &mut lanes {
+            *lane = *lane * 1.000_001 + 0.000_001;
+        }
+    }
+    black_box(lanes);
+    20_000 * 8
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn simd_avx2_fma_block(seed: u64) -> u64 {
+    use std::arch::x86_64::*;
+    let mut value = _mm256_set1_ps(seed as f32 * 1e-6 + 1.0);
+    let scale = _mm256_set1_ps(1.000_001);
+    let add = _mm256_set1_ps(0.000_001);
+    for _ in 0..20_000 {
+        value = _mm256_fmadd_ps(value, scale, add);
+    }
+    black_box(_mm256_cvtss_f32(value));
+    20_000 * 16
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn simd_sse2_block(seed: u64) -> u64 {
+    use std::arch::x86_64::*;
+    let mut value = _mm_set1_ps(seed as f32 * 1e-6 + 1.0);
+    let scale = _mm_set1_ps(1.000_001);
+    let add = _mm_set1_ps(0.000_001);
+    for _ in 0..20_000 {
+        value = _mm_add_ps(_mm_mul_ps(value, scale), add);
+    }
+    black_box(_mm_cvtss_f32(value));
+    20_000 * 8
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn simd_neon_block(seed: u64) -> u64 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut value = vdupq_n_f32(seed as f32 * 1e-6 + 1.0);
+        let scale = vdupq_n_f32(1.000_001);
+        let add = vdupq_n_f32(0.000_001);
+        for _ in 0..20_000 {
+            value = vfmaq_f32(add, value, scale);
+        }
+        black_box(vgetq_lane_f32(value, 0));
+    }
+    20_000 * 8
+}
+
+fn simd_path() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            return "avx2-fma";
+        }
+        if std::arch::is_x86_feature_detected!("sse2") {
+            return "sse2";
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return "neon";
+    }
+    #[allow(unreachable_code)]
+    "scalar"
+}
+
+fn geometric_mean(values: impl Iterator<Item = f64>) -> f64 {
+    let values: Vec<_> = values
+        .filter(|value| *value > 0.0 && value.is_finite())
+        .collect();
+    if values.is_empty() {
+        0.0
+    } else {
+        (values.iter().map(|value| value.ln()).sum::<f64>() / values.len() as f64).exp()
+    }
+}
+
+fn cpu_score_v2(single_gops: f64, multi_gops: f64) -> f64 {
+    if single_gops <= 0.0 || multi_gops <= 0.0 {
+        0.0
+    } else {
+        100.0 * single_gops.powf(0.35) * multi_gops.powf(0.65)
+    }
+}
+
+fn class_ratio(stages: &[CpuStageResult]) -> Option<f64> {
+    let performance = stages
+        .iter()
+        .find(|stage| stage.cpu_class.as_deref() == Some("performance"))?
+        .composite_gops;
+    let efficiency = stages
+        .iter()
+        .find(|stage| stage.cpu_class.as_deref() == Some("efficiency"))?
+        .composite_gops;
+    (efficiency > 0.0).then_some(performance / efficiency)
 }
 
 fn bench_memory(args: &MemoryArgs, reporter: &Reporter) -> MemoryResult {
@@ -957,31 +1665,6 @@ fn lcg_next(state: u64) -> u64 {
     state.wrapping_mul(6364136223846793005).wrapping_add(1)
 }
 
-fn is_prime(n: u64) -> bool {
-    if n < 2 {
-        return false;
-    }
-    if n == 2 {
-        return true;
-    }
-    if n.is_multiple_of(2) {
-        return false;
-    }
-
-    let mut d = 3u64;
-    while d.saturating_mul(d) <= n {
-        if n.is_multiple_of(d) {
-            return false;
-        }
-        d += 2;
-    }
-    true
-}
-
-fn cpu_score(throughput: f64) -> f64 {
-    throughput / 1000.0
-}
-
 fn memory_score(seq_w: f64, seq_r: f64, rand_w: f64, rand_r: f64) -> f64 {
     (seq_w + seq_r + rand_w + rand_r) / 4.0 / 100.0
 }
@@ -1032,13 +1715,16 @@ fn print_suite(result: &SuiteResult) {
             .bright_blue()
             .bold()
     );
-    println!("\n{}", "");
+    println!();
 
     if let Some(cpu) = &result.cpu {
         print_section(
             "CPU",
             cpu.score,
-            &[("Prime/s", cpu.throughput_primes_per_sec)],
+            &[
+                ("Single-thread score", cpu.single_thread_score),
+                ("All-logical score", cpu.multi_thread_score),
+            ],
         );
     }
 
@@ -1106,42 +1792,67 @@ fn print_section(name: &str, score: f64, metrics: &[(&str, f64)]) {
 }
 
 fn print_cpu(cpu: &CpuResult) {
-    println!("{}", "⚙️  CPU benchmark".bright_green().bold());
+    println!("{}", "⚙️  CPU benchmark v2".bright_green().bold());
     print_section(
         "CPU",
         cpu.score,
-        &[("Prime/s", cpu.throughput_primes_per_sec)],
+        &[
+            ("Single-thread score", cpu.single_thread_score),
+            ("All-logical score", cpu.multi_thread_score),
+        ],
     );
+    println!(
+        "  Logical CPUs: {}  Physical cores: {}  SMT: {}",
+        cpu.topology.logical_cpus.len(),
+        cpu.topology.physical_cores,
+        cpu.topology.smt_threads_per_core
+    );
+    println!(
+        "  Placement: {}  SIMD: {}",
+        cpu.capabilities.placement, cpu.capabilities.simd_path
+    );
+    for stage in &cpu.stages {
+        println!(
+            "  {:<20} {:>8.2} GOPS  {:>2} threads",
+            stage.id, stage.composite_gops, stage.threads
+        );
+    }
+    if let Some(gain) = cpu.smt_gain_percent {
+        println!("  SMT gain: {gain:.1}%");
+    }
+    if let Some(ratio) = cpu.performance_efficiency_ratio {
+        println!("  Performance/efficiency ratio: {ratio:.2}x");
+    }
 }
 
 fn print_cpu_sequence(sequence: &CpuSequenceResult) {
     println!("{}", "⚙️  CPU scaling benchmark".bright_green().bold());
-    println!("{}", "");
+    println!();
     println!(
         "  {}",
         format!(
             "{} test(s), {}s each",
             sequence.results.len(),
-            sequence.duration_secs_per_test
+            sequence.duration_secs_per_stage
         )
         .bright_white()
     );
 
     for result in &sequence.results {
         println!(
-            "  {:>2} thread{}  {:>12.2} prime/s",
+            "  {:>2} thread{}  {:>12.2} GOPS",
             result.threads,
             if result.threads == 1 { " " } else { "s" },
-            result.throughput_primes_per_sec
+            result.composite_gops
         );
     }
 
     let values: Vec<f64> = sequence
         .results
         .iter()
-        .map(|result| result.throughput_primes_per_sec)
+        .map(|result| result.composite_gops)
         .collect();
-    println!("\n  {}", "Prime/s".bright_yellow());
+    println!("\n  {}", "Composite GOPS".bright_yellow());
     for line in sparkline(&values).lines() {
         println!("  {}", color_chart_line(line));
     }
@@ -1201,7 +1912,7 @@ fn sparkline(values: &[f64]) -> String {
         return String::new();
     };
 
-    let column_width = values.len().max(1).to_string().len().max(1);
+    let label_width = values.len().max(1).to_string().len().max(1);
     let heights: Vec<usize> = values
         .iter()
         .map(|value| {
@@ -1220,22 +1931,18 @@ fn sparkline(values: &[f64]) -> String {
         lines.push(
             heights
                 .iter()
-                .map(|height| {
-                    format!(
-                        "{:^width$}",
-                        if *height >= row { "█" } else { "┄" },
-                        width = column_width
-                    )
-                })
+                .map(|height| if *height >= row { "█" } else { "┄" }.to_string())
                 .collect::<Vec<_>>()
                 .join(COLUMN_GAP),
         );
     }
     lines.push(
         (1..=values.len())
-            .map(|thread_count| format!("{thread_count:^width$}", width = column_width))
+            .map(|thread_count| format!("{thread_count:<label_width$}"))
             .collect::<Vec<_>>()
-            .join("   "),
+            // Plot columns are one character wide; labels may be wider (e.g. "10").
+            // Shorten their separator to retain the same chart-column pitch.
+            .join(&" ".repeat(COLUMN_GAP.chars().count().saturating_sub(label_width - 1))),
     );
     lines.join("\n")
 }
@@ -1300,13 +2007,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prime_detection_is_correct_for_small_values() {
-        assert!(!is_prime(1));
-        assert!(is_prime(2));
-        assert!(is_prime(3));
-        assert!(!is_prime(4));
-        assert!(is_prime(29));
-        assert!(!is_prime(35));
+    fn cpu_list_parser_handles_ranges_and_individual_cpus() {
+        assert_eq!(parse_cpu_list("0-2, 5, 7-8\n"), vec![0, 1, 2, 5, 7, 8]);
     }
 
     #[test]
@@ -1329,18 +2031,27 @@ mod tests {
         assert_eq!(lines.last(), Some(&"1   2   3"));
         assert_eq!(lines[0], "┄┄┄┄┄┄┄┄█");
         assert_eq!(lines[4], "█┄┄┄█┄┄┄█");
+
+        let ten_threads = sparkline(&(1..=10).map(f64::from).collect::<Vec<_>>());
+        assert!(ten_threads.lines().take(5).all(|line| !line.contains(' ')));
     }
 
     #[test]
-    fn zero_threads_resolves_to_available_logical_cpus() {
-        assert_eq!(
-            resolve_threads(0),
-            thread::available_parallelism().map_or(1, usize::from)
-        );
+    fn cpu_v2_score_uses_weighted_geometric_mean() {
+        let score = cpu_score_v2(4.0, 16.0);
+        assert!((score - 984.916).abs() < 0.01);
     }
 
     #[test]
-    fn non_zero_threads_are_preserved() {
-        assert_eq!(resolve_threads(3), 3);
+    fn selected_cpu_limit_is_applied() {
+        let topology = fallback_cpu_topology("test");
+        assert_eq!(select_cpus(&topology, 1).len(), 1);
+        assert_eq!(select_cpus(&topology, 0).len(), topology.logical_cpus.len());
+    }
+
+    #[test]
+    fn compute_kernels_report_their_fixed_operation_counts() {
+        assert_eq!(integer_block(1), 240_000);
+        assert_eq!(floating_point_block(1), 240_000);
     }
 }

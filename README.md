@@ -2,10 +2,15 @@
 
 `nsysbench` is a command-based Rust benchmarking tool to compare machine raw performance.
 
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for a full explanation of every
+command and flag, and the concepts behind the numbers they report (GOPS,
+IOPS, SMT, core classes, and the score formulas).
+
 ## Features
 
 - Colorful, UTF-8 friendly terminal output
-- CPU raw speed benchmark (prime throughput with configurable threads: 1, 2, N)
+- CPU score v2: scalar integer, scalar floating-point, and SIMD compute kernels
+- Topology-aware CPU stages for single thread, core classes, physical cores, SMT, and all logical CPUs
 - Memory raw speed benchmark (sequential/random read and write)
 - Storage IO raw speed benchmark (sequential/random read and write with IOPS + throughput)
 - Network raw speed benchmark to a target URL
@@ -28,16 +33,18 @@ Run full suite (CPU + memory + IO, optional network):
 cargo run -- run --threads 2 --duration 5 --memory-mb 256 --io-path /tmp --target https://speed.hetzner.de/1MB.bin
 ```
 
-Run only CPU benchmark:
+Run the topology-aware CPU benchmark (about 30 seconds on a typical hybrid CPU):
 
 ```bash
-cargo run -- cpu --threads 1 --duration 5
-cargo run -- cpu --threads 2 --duration 5
-cargo run -- cpu --threads 8 --duration 5
+cargo run --release -- cpu
+cargo run --release -- cpu --threads 1
+cargo run --release -- cpu --threads 8
 ```
 
-Set `--threads 0` to automatically use every logical CPU available to the
-process.
+`--threads 0` (the default) uses every logical CPU available to the process.
+`--duration` is the measured seconds for each topology stage. Results include
+the selected SIMD path, placement capability, per-workload stability, physical
+core throughput, all-logical throughput, and SMT gain when applicable.
 
 Show the performance-relevant CPU, memory, and storage metadata separately:
 
@@ -46,10 +53,10 @@ cargo run -- info --path /tmp
 cargo run -- --json info --path /tmp
 ```
 
-Compare CPU scaling from one worker through the requested thread count. Each
-test runs sequentially for the same duration; normal terminal output includes a
-five-row UTF-8 prime/s chart with muted dotted grid lines and three spaces
-between thread counts, while JSON output contains every individual result:
+Run the expensive full scaling diagnostic from one worker through the requested
+thread count. Each test runs sequentially for the same duration; normal terminal
+output includes a five-row UTF-8 GOPS chart, while JSON output contains every
+individual stage:
 
 ```bash
 cargo run -- cpu --threads 8 --duration 5 --sequence

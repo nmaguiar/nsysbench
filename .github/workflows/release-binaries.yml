@@ -21,10 +21,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-linux-gnu
             binary: nsysbench
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-linux-gnu
             binary: nsysbench
           - os: macos-13
             target: x86_64-apple-darwin

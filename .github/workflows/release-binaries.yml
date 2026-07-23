@@ -1,0 +1,85 @@
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create or update (for example, v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: nsysbench
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: nsysbench
+          - os: macos-13
+            target: x86_64-apple-darwin
+            binary: nsysbench
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: nsysbench
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: nsysbench.exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: nsysbench.exe
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --locked --release
+      - name: Package binary
+        id: package
+        shell: bash
+        run: |
+          archive="nsysbench-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" -C target/release "${{ matrix.binary }}"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsysbench-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Attach binaries to release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: nsysbench-*
+          merge-multiple: true
+      - name: Write checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --generate-notes
+          fi

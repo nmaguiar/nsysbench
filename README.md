@@ -67,3 +67,10 @@ Use Rust target triples to compile for major OS/architectures, e.g.:
 rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu aarch64-apple-darwin
 cargo build --release --target x86_64-unknown-linux-gnu
 ```
+
+## Release binaries
+
+The **Release binaries** GitHub Actions workflow builds native release archives for
+Linux, macOS, and Windows on x86_64 and ARM64. Publishing a GitHub release attaches
+all six archives plus `SHA256SUMS` to that release. It can also be run manually from
+the Actions tab; provide the tag of the release to create or update.

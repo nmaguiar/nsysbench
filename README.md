@@ -30,15 +30,15 @@ cargo build --release
 Run full suite (CPU + memory + IO, optional network):
 
 ```bash
-cargo run -- run --threads 2 --duration 5 --memory-mb 256 --io-path /tmp --target https://speed.hetzner.de/1MB.bin
+nsysbench run --threads 2 --duration 5 --memory-mb 256 --io-path /tmp --target https://speed.hetzner.de/1MB.bin
 ```
 
 Run the topology-aware CPU benchmark (about 30 seconds on a typical hybrid CPU):
 
 ```bash
-cargo run --release -- cpu
-cargo run --release -- cpu --threads 1
-cargo run --release -- cpu --threads 8
+nsysbench cpu
+nsysbench cpu --threads 1
+nsysbench cpu --threads 8
 ```
 
 `--threads 0` (the default) uses every logical CPU available to the process.
@@ -49,8 +49,8 @@ core throughput, all-logical throughput, and SMT gain when applicable.
 Show the performance-relevant CPU, memory, and storage metadata separately:
 
 ```bash
-cargo run -- info --path /tmp
-cargo run -- --json info --path /tmp
+nsysbench info --path /tmp
+nsysbench --json info --path /tmp
 ```
 
 Run the expensive full scaling diagnostic from one worker through the requested
@@ -59,32 +59,32 @@ output includes a five-row UTF-8 GOPS chart, while JSON output contains every
 individual stage:
 
 ```bash
-cargo run -- cpu --threads 8 --duration 5 --sequence
-cargo run -- --json cpu --threads 8 --duration 5 --sequence
+nsysbench cpu --threads 8 --duration 5 --sequence
+nsysbench --json cpu --threads 8 --duration 5 --sequence
 ```
 
 Run only memory benchmark:
 
 ```bash
-cargo run -- memory --size-mb 256 --duration 8
+nsysbench memory --size-mb 256 --duration 8
 ```
 
 Run only IO benchmark:
 
 ```bash
-cargo run -- io --path /tmp --block-kb 4 --file-size-mb 64 --duration 8
+nsysbench io --path /tmp --block-kb 4 --file-size-mb 64 --duration 8
 ```
 
 Run only network benchmark:
 
 ```bash
-cargo run -- network --target https://speed.hetzner.de/1MB.bin --duration 8
+nsysbench network --target https://speed.hetzner.de/1MB.bin --duration 8
 ```
 
 JSON output:
 
 ```bash
-cargo run -- --json run --threads 2 --duration 5 --io-path /tmp
+nsysbench --json run --threads 2 --duration 5 --io-path /tmp
 ```
 
 Normal terminal output reports benchmark progress on stderr. This keeps stdout
@@ -93,7 +93,7 @@ to suppress those messages; `--json` also suppresses them so JSON output stays
 machine-readable.
 
 ```bash
-cargo run -- --quiet cpu --threads 2 --duration 5
+nsysbench --quiet cpu --threads 2 --duration 5
 ```
 
 ## Cross compilation

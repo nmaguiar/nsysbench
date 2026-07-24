@@ -1945,6 +1945,17 @@ fn print_cpu_sequence(sequence: &CpuSequenceResult) {
         println!("  {}", color_chart_line(line));
     }
     println!("  {}", "threads".dimmed());
+
+    let primes_values: Vec<f64> = sequence
+        .results
+        .iter()
+        .map(|result| result.primes.events_per_sec)
+        .collect();
+    println!("\n  {}", "Primes/s".bright_yellow());
+    for line in sparkline(&primes_values).lines() {
+        println!("  {}", color_chart_line(line));
+    }
+    println!("  {}", "threads".dimmed());
 }
 
 fn print_system_info(info: &SystemInfo) {

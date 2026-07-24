@@ -21,11 +21,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            target: x86_64-linux
+            target: unknown-x86_64-linux-musl
             linker: musl-gcc
             binary: nsysbench
           - os: ubuntu-24.04-arm
-            target: aarch64-linux
+            target: unknown-aarch64-linux-musl
             linker: musl-gcc
             binary: nsysbench
           - os: macos-14

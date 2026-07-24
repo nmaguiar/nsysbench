@@ -21,21 +21,31 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            target: unknown-x86_64-linux-musl
+            target: x86_64-unknown-linux-musl
+            archive_os: linux
+            archive_arch: x86_64
             linker: musl-gcc
             binary: nsysbench
           - os: ubuntu-24.04-arm
-            target: unknown-aarch64-linux-musl
+            target: aarch64-unknown-linux-musl
+            archive_os: linux
+            archive_arch: aarch64
             linker: musl-gcc
             binary: nsysbench
           - os: macos-14
             target: aarch64-apple-darwin
+            archive_os: macos
+            archive_arch: aarch64
             binary: nsysbench
           - os: windows-2022
             target: x86_64-pc-windows-msvc
+            archive_os: windows
+            archive_arch: x86_64
             binary: nsysbench.exe
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
+            archive_os: windows
+            archive_arch: aarch64
             binary: nsysbench.exe
     runs-on: ${{ matrix.os }}
 
@@ -56,7 +66,7 @@ jobs:
         id: package
         shell: bash
         run: |
-          archive="nsysbench-${{ matrix.target }}.tar.gz"
+          archive="nsysbench-${{ github.event.release.tag_name || inputs.tag }}-${{ matrix.archive_os }}-${{ matrix.archive_arch }}.tar.gz"
           tar -czf "$archive" -C "target/${{ matrix.target }}/release" "${{ matrix.binary }}"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
       - name: Upload release asset

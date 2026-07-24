@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use reqwest::blocking::Client;
 use serde::Serialize;
@@ -61,6 +61,27 @@ struct CpuArgs {
     /// Upper bound for the sysbench-compatible prime-counting kernel (matches sysbench's --cpu-max-prime)
     #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(3..))]
     cpu_max_prime: u64,
+    /// How to place prime workers (scheduler matches sysbench; pinned preserves the former behavior)
+    #[arg(long, value_enum, default_value_t = PrimePlacement::Scheduler)]
+    prime_placement: PrimePlacement,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum PrimePlacement {
+    /// Let the operating system scheduler place workers, like sysbench.
+    #[default]
+    Scheduler,
+    /// Pin workers to the topology stage CPUs (or use macOS QoS hints).
+    Pinned,
+}
+
+impl PrimePlacement {
+    fn as_str(self, capabilities: &CpuCapabilities) -> String {
+        match self {
+            Self::Scheduler => "scheduler".to_string(),
+            Self::Pinned => capabilities.placement.clone(),
+        }
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -213,6 +234,7 @@ struct CpuWorkloadResult {
 #[derive(Debug, Serialize)]
 struct CpuPrimesResult {
     max_prime: u64,
+    placement: String,
     events_per_sec: f64,
     min_events_per_sec: f64,
     max_events_per_sec: f64,
@@ -405,6 +427,7 @@ fn run_suite(args: RunArgs, reporter: &Reporter) -> Result<SuiteResult, Box<dyn 
             duration: args.duration,
             sequence: false,
             cpu_max_prime: 10_000,
+            prime_placement: PrimePlacement::Scheduler,
         },
         reporter,
     ));
@@ -667,6 +690,7 @@ fn bench_cpu(args: &CpuArgs, reporter: &Reporter) -> CpuResult {
             args.duration.max(1),
             &capabilities,
             args.cpu_max_prime,
+            args.prime_placement,
         ));
     }
 
@@ -731,7 +755,15 @@ fn bench_cpu_sequence(args: &CpuArgs, reporter: &Reporter) -> CpuSequenceResult 
             cpu_class: None,
             cpus: selected[..count].to_vec(),
         })
-        .map(|stage| run_cpu_stage(&stage, duration, &capabilities, args.cpu_max_prime))
+        .map(|stage| {
+            run_cpu_stage(
+                &stage,
+                duration,
+                &capabilities,
+                args.cpu_max_prime,
+                args.prime_placement,
+            )
+        })
         .collect();
     let single = results.first().map_or(0.0, |stage| stage.composite_gops);
     for stage in &mut results {
@@ -1118,6 +1150,7 @@ fn run_cpu_stage(
     duration_secs: u64,
     capabilities: &CpuCapabilities,
     cpu_max_prime: u64,
+    prime_placement: PrimePlacement,
 ) -> CpuStageResult {
     let samples_per_workload = 3usize;
     let sample_duration = Duration::from_secs_f64(
@@ -1126,13 +1159,18 @@ fn run_cpu_stage(
     let mut workloads = Vec::new();
     for workload in CpuWorkload::ALL {
         let mut samples = Vec::with_capacity(samples_per_workload);
-        let _ = run_parallel_workload(stage, workload, Duration::from_millis(30), capabilities);
+        let _ = run_parallel_workload(
+            stage,
+            workload,
+            Duration::from_millis(30),
+            &capabilities.placement,
+        );
         for _ in 0..samples_per_workload {
             samples.push(run_parallel_workload(
                 stage,
                 workload,
                 sample_duration,
-                capabilities,
+                &capabilities.placement,
             ));
         }
         let (median, min, max, cv) = sample_stats(samples);
@@ -1150,24 +1188,26 @@ fn run_cpu_stage(
     // events/sec rather than folded into composite_gops, since its per-event
     // cost isn't a fixed ops/block constant like the other kernels.
     let primes_workload = CpuWorkload::Primes(cpu_max_prime);
+    let prime_placement = prime_placement.as_str(capabilities);
     let mut primes_samples = Vec::with_capacity(samples_per_workload);
     let _ = run_parallel_workload(
         stage,
         primes_workload,
         Duration::from_millis(30),
-        capabilities,
+        &prime_placement,
     );
     for _ in 0..samples_per_workload {
         primes_samples.push(run_parallel_workload(
             stage,
             primes_workload,
             sample_duration,
-            capabilities,
+            &prime_placement,
         ));
     }
     let (primes_median, primes_min, primes_max, primes_cv) = sample_stats(primes_samples);
     let primes = CpuPrimesResult {
         max_prime: cpu_max_prime,
+        placement: prime_placement,
         events_per_sec: primes_median,
         min_events_per_sec: primes_min,
         max_events_per_sec: primes_max,
@@ -1205,14 +1245,14 @@ fn run_parallel_workload(
     stage: &CpuStage,
     workload: CpuWorkload,
     duration: Duration,
-    capabilities: &CpuCapabilities,
+    placement: &str,
 ) -> f64 {
     let barrier = Arc::new(Barrier::new(stage.cpus.len() + 1));
     let mut handles = Vec::with_capacity(stage.cpus.len());
     for (worker, cpu) in stage.cpus.iter().copied().enumerate() {
         let barrier = Arc::clone(&barrier);
         let class = stage.cpu_class.clone();
-        let placement = capabilities.placement.clone();
+        let placement = placement.to_string();
         handles.push(thread::spawn(move || {
             apply_worker_placement(cpu, class.as_deref(), &placement);
             barrier.wait();
@@ -1785,21 +1825,15 @@ fn print_report_separator() {
 fn print_suite(result: &SuiteResult) {
     println!(
         "\n{}",
-        "╔══════════════════════════════════╗"
-            .bright_blue()
-            .bold()
+        "╔══════════════════════════════════╗".bright_blue().bold()
     );
     println!(
         "{}",
-        "║ ⚡nsysbench performance report ⚡║"
-            .bright_blue()
-            .bold()
+        "║ ⚡nsysbench performance report ⚡║".bright_blue().bold()
     );
     println!(
         "{}",
-        "╚══════════════════════════════════╝"
-            .bright_blue()
-            .bold()
+        "╚══════════════════════════════════╝".bright_blue().bold()
     );
 
     if let Some(cpu) = &result.cpu {
@@ -1817,7 +1851,7 @@ fn print_suite(result: &SuiteResult) {
         print_section(
             "MEMORY",
             mem.score,
-            &[    
+            &[
                 ("Seq Write MB/s     ", mem.seq_write_mb_s),
                 ("Seq Read MB/s      ", mem.seq_read_mb_s),
                 ("Rand Write MB/s    ", mem.rand_write_mb_s),
@@ -1830,7 +1864,7 @@ fn print_suite(result: &SuiteResult) {
         print_section(
             "IO",
             io.score,
-            &[ 
+            &[
                 ("Seq Write MB/s     ", io.seq_write_mb_s),
                 ("Seq Read MB/s      ", io.seq_read_mb_s),
                 ("Rand Write MB/s    ", io.rand_write_mb_s),
@@ -1847,7 +1881,7 @@ fn print_suite(result: &SuiteResult) {
         print_section(
             "NETWORK",
             net.score,
-            &[   
+            &[
                 ("Throughput MB/s    ", net.throughput_mb_s),
                 ("Req/s              ", net.requests_per_sec),
                 ("Latency ms         ", net.avg_latency_ms),
@@ -1893,10 +1927,13 @@ fn print_cpu(cpu: &CpuResult) {
         cpu.topology.smt_threads_per_core
     );
     println!(
-        "  Placement: {} | SIMD: {} | Primes kernel: max-prime {} (sysbench-compatible)",
+        "  GOPS placement: {} | SIMD: {} | Primes kernel: max-prime {} (sysbench-compatible, {})",
         cpu.capabilities.placement,
         cpu.capabilities.simd_path,
-        cpu.stages.first().map_or(0, |stage| stage.primes.max_prime)
+        cpu.stages.first().map_or(0, |stage| stage.primes.max_prime),
+        cpu.stages
+            .first()
+            .map_or("scheduler", |stage| stage.primes.placement.as_str())
     );
     for stage in &cpu.stages {
         println!(
@@ -1959,7 +1996,10 @@ fn print_cpu_sequence(sequence: &CpuSequenceResult) {
 }
 
 fn print_system_info(info: &SystemInfo) {
-    println!("{}", "ℹ️ System performance metadata  ".bright_green().bold());
+    println!(
+        "{}",
+        "ℹ️ System performance metadata  ".bright_green().bold()
+    );
     println!("\n{}", "CPU".bright_cyan().bold());
     println!(
         "  Logical CPUs: {} | Physical cores: {}",
@@ -2067,7 +2107,7 @@ fn print_memory(mem: &MemoryResult) {
     print_section(
         "MEMORY",
         mem.score,
-        &[   
+        &[
             ("Seq Write MB/s     ", mem.seq_write_mb_s),
             ("Seq Read MB/s      ", mem.seq_read_mb_s),
             ("Rand Write MB/s    ", mem.rand_write_mb_s),
@@ -2081,7 +2121,7 @@ fn print_io(io: &IoResult) {
     print_section(
         "IO",
         io.score,
-        &[ 
+        &[
             ("Seq Write MB/s     ", io.seq_write_mb_s),
             ("Seq Read MB/s      ", io.seq_read_mb_s),
             ("Rand Write MB/s    ", io.rand_write_mb_s),
@@ -2099,7 +2139,7 @@ fn print_network(net: &NetworkResult) {
     print_section(
         "NETWORK",
         net.score,
-        &[ 
+        &[
             ("Throughput MB/s    ", net.throughput_mb_s),
             ("Req/s              ", net.requests_per_sec),
             ("Latency ms         ", net.avg_latency_ms),
@@ -2168,5 +2208,13 @@ mod tests {
         assert_eq!(primes_block(10), 1);
         assert_eq!(primes_block(10_000), 1);
         assert_eq!(primes_block(0), 1);
+    }
+
+    #[test]
+    fn prime_placement_defaults_to_scheduler() {
+        assert!(matches!(
+            PrimePlacement::default(),
+            PrimePlacement::Scheduler
+        ));
     }
 }

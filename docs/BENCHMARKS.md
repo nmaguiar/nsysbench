@@ -91,9 +91,9 @@ cores.
 
 ### Placement
 
-`placement` describes how worker threads are pinned to specific logical
-CPUs for a stage, which affects how trustworthy per-class/per-core numbers
-are:
+`placement` describes how the three GOPS worker workloads are pinned to
+specific logical CPUs for a stage, which affects how trustworthy
+per-class/per-core numbers are:
 
 - **`pinned`** (Linux): `sched_setaffinity` binds each worker thread to one
   exact logical CPU, so a stage's threads run only on the CPUs it names.
@@ -103,6 +103,13 @@ are:
   is advisory rather than guaranteed.
 - **`scheduler`** (other platforms): no pinning is attempted; the OS
   scheduler places threads freely.
+
+The primes workload reports its placement separately as `primes.placement`.
+It defaults to **`scheduler`** on every platform: no CPU affinity or macOS QoS
+hint is applied, matching sysbench's normal worker-thread scheduling model.
+Use `--prime-placement pinned` to restore nsysbench's former behavior for the
+primes workload (`pinned` on Linux and `qos-advisory` on macOS). The GOPS
+workloads retain the stage placement described above regardless of this flag.
 
 ### SIMD path
 
@@ -131,6 +138,11 @@ same-ballpark comparison against `sysbench --cpu-max-prime=N --threads=T
 run`'s reported `events/sec` on the same machine. It won't be bit-identical
 — Rust vs. C codegen and libm `sqrt` implementations differ slightly — but
 it isolates the same algorithm and instruction mix.
+
+By default its workers are also left to the normal OS scheduler, rather than
+being affinitized to the topology stage CPUs, which matches sysbench's
+execution model. Use `--prime-placement pinned` when topology isolation is
+more important than direct sysbench comparison.
 
 Unlike the three GOPS workloads, `primes` is **not** included in
 `composite_gops` or the CPU score. Its "operation" (one sweep) does a
@@ -172,7 +184,7 @@ scaling) and should be treated with more caution.
 ### `cpu` — CPU raw processing and topology scaling
 
 ```bash
-nsysbench cpu [--threads N] [--duration SECS] [--sequence] [--cpu-max-prime N]
+nsysbench cpu [--threads N] [--duration SECS] [--sequence] [--cpu-max-prime N] [--prime-placement scheduler|pinned]
 ```
 
 | Flag | Default | Meaning |
@@ -181,6 +193,7 @@ nsysbench cpu [--threads N] [--duration SECS] [--sequence] [--cpu-max-prime N]
 | `-d`, `--duration` | `8` | Measured seconds **per stage** (or, with `--sequence`, per thread count) — not a total run time. |
 | `--sequence` | off | Run one stage per thread count, from 1 up to the selected thread limit, instead of the fixed topology checkpoints below. |
 | `--cpu-max-prime` | `10000` | Upper bound for the sysbench-compatible `primes` kernel (see [Primes kernel](#primes-kernel-sysbench-compatible)). Matches sysbench's own `--cpu-max-prime` flag and default. |
+| `--prime-placement` | `scheduler` | Placement for the `primes` workers. `scheduler` lets the normal OS scheduler assign workers, matching sysbench. `pinned` restores the former per-stage placement (`sched_setaffinity` on Linux; QoS advisory on macOS). |
 
 **Without `--sequence`**, nsysbench first detects CPU topology (logical
 CPUs, physical cores, SMT ratio, core classes) and then runs a fixed set of

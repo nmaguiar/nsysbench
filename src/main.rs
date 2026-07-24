@@ -58,6 +58,9 @@ struct CpuArgs {
     /// Run every thread count from 1 through --threads instead of topology checkpoints
     #[arg(long)]
     sequence: bool,
+    /// Upper bound for the sysbench-compatible prime-counting kernel (matches sysbench's --cpu-max-prime)
+    #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(3..))]
+    cpu_max_prime: u64,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -190,6 +193,7 @@ struct CpuStageResult {
     placement: String,
     logical_cpus: Vec<usize>,
     workloads: Vec<CpuWorkloadResult>,
+    primes: CpuPrimesResult,
     composite_gops: f64,
     score: f64,
     scaling_factor: f64,
@@ -203,6 +207,15 @@ struct CpuWorkloadResult {
     operations_per_sec: f64,
     min_operations_per_sec: f64,
     max_operations_per_sec: f64,
+    coefficient_of_variation_percent: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct CpuPrimesResult {
+    max_prime: u64,
+    events_per_sec: f64,
+    min_events_per_sec: f64,
+    max_events_per_sec: f64,
     coefficient_of_variation_percent: f64,
 }
 
@@ -391,6 +404,7 @@ fn run_suite(args: RunArgs, reporter: &Reporter) -> Result<SuiteResult, Box<dyn 
             threads,
             duration: args.duration,
             sequence: false,
+            cpu_max_prime: 10_000,
         },
         reporter,
     ));
@@ -648,7 +662,12 @@ fn bench_cpu(args: &CpuArgs, reporter: &Reporter) -> CpuResult {
             stage.id,
             stage.cpus.len()
         ));
-        results.push(run_cpu_stage(&stage, args.duration.max(1), &capabilities));
+        results.push(run_cpu_stage(
+            &stage,
+            args.duration.max(1),
+            &capabilities,
+            args.cpu_max_prime,
+        ));
     }
 
     let single = results
@@ -712,7 +731,7 @@ fn bench_cpu_sequence(args: &CpuArgs, reporter: &Reporter) -> CpuSequenceResult 
             cpu_class: None,
             cpus: selected[..count].to_vec(),
         })
-        .map(|stage| run_cpu_stage(&stage, duration, &capabilities))
+        .map(|stage| run_cpu_stage(&stage, duration, &capabilities, args.cpu_max_prime))
         .collect();
     let single = results.first().map_or(0.0, |stage| stage.composite_gops);
     for stage in &mut results {
@@ -1050,6 +1069,7 @@ enum CpuWorkload {
     Integer,
     FloatingPoint,
     Simd,
+    Primes(u64),
 }
 
 impl CpuWorkload {
@@ -1060,6 +1080,7 @@ impl CpuWorkload {
             Self::Integer => "scalar-integer",
             Self::FloatingPoint => "scalar-fp",
             Self::Simd => "simd-fp",
+            Self::Primes(_) => "primes",
         }
     }
 
@@ -1068,14 +1089,35 @@ impl CpuWorkload {
             Self::Integer => integer_block(seed),
             Self::FloatingPoint => floating_point_block(seed),
             Self::Simd => simd_block(seed),
+            Self::Primes(max_prime) => primes_block(max_prime),
         }
     }
+}
+
+fn sample_stats(mut samples: Vec<f64>) -> (f64, f64, f64, f64) {
+    samples.sort_by(f64::total_cmp);
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let variance = samples
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / samples.len() as f64;
+    let median = samples[samples.len() / 2];
+    let min = samples[0];
+    let max = samples[samples.len() - 1];
+    let cv = if mean > 0.0 {
+        variance.sqrt() / mean * 100.0
+    } else {
+        0.0
+    };
+    (median, min, max, cv)
 }
 
 fn run_cpu_stage(
     stage: &CpuStage,
     duration_secs: u64,
     capabilities: &CpuCapabilities,
+    cpu_max_prime: u64,
 ) -> CpuStageResult {
     let samples_per_workload = 3usize;
     let sample_duration = Duration::from_secs_f64(
@@ -1093,25 +1135,45 @@ fn run_cpu_stage(
                 capabilities,
             ));
         }
-        samples.sort_by(f64::total_cmp);
-        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-        let variance = samples
-            .iter()
-            .map(|value| (value - mean).powi(2))
-            .sum::<f64>()
-            / samples.len() as f64;
+        let (median, min, max, cv) = sample_stats(samples);
         workloads.push(CpuWorkloadResult {
             name: workload.name().to_string(),
-            operations_per_sec: samples[samples.len() / 2],
-            min_operations_per_sec: samples[0],
-            max_operations_per_sec: samples[samples.len() - 1],
-            coefficient_of_variation_percent: if mean > 0.0 {
-                variance.sqrt() / mean * 100.0
-            } else {
-                0.0
-            },
+            operations_per_sec: median,
+            min_operations_per_sec: min,
+            max_operations_per_sec: max,
+            coefficient_of_variation_percent: cv,
         });
     }
+
+    // Sysbench-compatible kernel (ported from sysbench's cpu_execute_event):
+    // sampled the same way as the other workloads, but reported as its own
+    // events/sec rather than folded into composite_gops, since its per-event
+    // cost isn't a fixed ops/block constant like the other kernels.
+    let primes_workload = CpuWorkload::Primes(cpu_max_prime);
+    let mut primes_samples = Vec::with_capacity(samples_per_workload);
+    let _ = run_parallel_workload(
+        stage,
+        primes_workload,
+        Duration::from_millis(30),
+        capabilities,
+    );
+    for _ in 0..samples_per_workload {
+        primes_samples.push(run_parallel_workload(
+            stage,
+            primes_workload,
+            sample_duration,
+            capabilities,
+        ));
+    }
+    let (primes_median, primes_min, primes_max, primes_cv) = sample_stats(primes_samples);
+    let primes = CpuPrimesResult {
+        max_prime: cpu_max_prime,
+        events_per_sec: primes_median,
+        min_events_per_sec: primes_min,
+        max_events_per_sec: primes_max,
+        coefficient_of_variation_percent: primes_cv,
+    };
+
     let composite_gops = geometric_mean(
         workloads
             .iter()
@@ -1120,6 +1182,7 @@ fn run_cpu_stage(
     let max_cv = workloads
         .iter()
         .map(|result| result.coefficient_of_variation_percent)
+        .chain(std::iter::once(primes.coefficient_of_variation_percent))
         .fold(0.0, f64::max);
     let stability_warning = (max_cv > 5.0).then(|| format!("high sample variation ({max_cv:.1}%)"));
     CpuStageResult {
@@ -1129,6 +1192,7 @@ fn run_cpu_stage(
         placement: capabilities.placement.clone(),
         logical_cpus: stage.cpus.clone(),
         workloads,
+        primes,
         composite_gops,
         score: composite_gops * 100.0,
         scaling_factor: 0.0,
@@ -1224,6 +1288,28 @@ fn floating_point_block(seed: u64) -> u64 {
     }
     black_box((a, b, c, d));
     20_000 * 12
+}
+
+/// One "event" of sysbench's cpu test, ported line-for-line from
+/// `cpu_execute_event` in sysbench's `sb_cpu.c`: for every integer from 3 up
+/// to (exclusive) `max_prime`, trial-divide by every `l` from 2 up to
+/// `sqrt(c)` (computed as `f64`, matching sysbench's `double t = sqrt((double)c)`)
+/// until a divisor is found. Ported this closely (including the sqrt-per-`c`
+/// call and the exclusive upper bound) so the per-event cost matches what
+/// `sysbench --cpu-max-prime=N run` measures on the same machine.
+fn primes_block(max_prime: u64) -> u64 {
+    for c in 3..max_prime {
+        let t = (c as f64).sqrt();
+        let mut l = 2u64;
+        while (l as f64) <= t {
+            if c % l == 0 {
+                break;
+            }
+            l += 1;
+        }
+        black_box(l);
+    }
+    1
 }
 
 fn simd_block(seed: u64) -> u64 {
@@ -1807,13 +1893,15 @@ fn print_cpu(cpu: &CpuResult) {
         cpu.topology.smt_threads_per_core
     );
     println!(
-        "  Placement: {} | SIMD: {}",
-        cpu.capabilities.placement, cpu.capabilities.simd_path
+        "  Placement: {} | SIMD: {} | Primes kernel: max-prime {} (sysbench-compatible)",
+        cpu.capabilities.placement,
+        cpu.capabilities.simd_path,
+        cpu.stages.first().map_or(0, |stage| stage.primes.max_prime)
     );
     for stage in &cpu.stages {
         println!(
-            "  {:<20} {:>8.2} GOPS  {:>2} threads",
-            stage.id, stage.composite_gops, stage.threads
+            "  {:<20} {:>8.2} GOPS  {:>12.0} primes/s  {:>2} threads",
+            stage.id, stage.composite_gops, stage.primes.events_per_sec, stage.threads
         );
     }
     if let Some(gain) = cpu.smt_gain_percent {
@@ -1839,10 +1927,11 @@ fn print_cpu_sequence(sequence: &CpuSequenceResult) {
 
     for result in &sequence.results {
         println!(
-            "  {:>2} thread{}  {:>12.2} GOPS",
+            "  {:>2} thread{}  {:>12.2} GOPS  {:>12.0} primes/s",
             result.threads,
             if result.threads == 1 { " " } else { "s" },
-            result.composite_gops
+            result.composite_gops,
+            result.primes.events_per_sec
         );
     }
 
@@ -2052,5 +2141,13 @@ mod tests {
     fn compute_kernels_report_their_fixed_operation_counts() {
         assert_eq!(integer_block(1), 240_000);
         assert_eq!(floating_point_block(1), 240_000);
+    }
+
+    #[test]
+    fn primes_block_reports_one_event_regardless_of_bound() {
+        assert_eq!(primes_block(3), 1);
+        assert_eq!(primes_block(10), 1);
+        assert_eq!(primes_block(10_000), 1);
+        assert_eq!(primes_block(0), 1);
     }
 }

@@ -10,6 +10,7 @@ IOPS, SMT, core classes, and the score formulas).
 
 - Colorful, UTF-8 friendly terminal output
 - CPU score v2: scalar integer, scalar floating-point, and SIMD compute kernels
+- Sysbench-compatible primes kernel reported alongside CPU score v2 for direct comparison against `sysbench cpu` numbers
 - Topology-aware CPU stages for single thread, core classes, physical cores, SMT, and all logical CPUs
 - Memory raw speed benchmark (sequential/random read and write)
 - Storage IO raw speed benchmark (sequential/random read and write with IOPS + throughput)
@@ -45,6 +46,19 @@ nsysbench cpu --threads 8
 `--duration` is the measured seconds for each topology stage. Results include
 the selected SIMD path, placement capability, per-workload stability, physical
 core throughput, all-logical throughput, and SMT gain when applicable.
+
+Each stage also reports `primes` events/sec from a kernel ported line-for-line
+from `sysbench cpu`'s trial-division prime-counting loop (same sqrt-per-candidate
+cost, same event definition), so a `nsysbench cpu` run's `primes/s` is a
+same-methodology, same-ballpark comparison against `sysbench
+--cpu-max-prime=N --threads=N run`'s `events/sec` on the same machine (not
+bit-identical — Rust vs. C codegen and libm differ slightly). Use
+`--cpu-max-prime` to match the bound used by a specific sysbench run
+(sysbench's own default is 10000, same as nsysbench's):
+
+```bash
+nsysbench cpu --cpu-max-prime 20000
+```
 
 Show the performance-relevant CPU, memory, and storage metadata separately:
 

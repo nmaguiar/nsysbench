@@ -112,6 +112,35 @@ used for the SIMD workload at runtime: `avx2-fma` or `sse2` on x86_64,
 GOPS-per-block constant for that workload (see GOPS above), so composite
 GOPS is only comparable across runs that used the same SIMD path.
 
+### Primes kernel (sysbench-compatible)
+
+Alongside the three GOPS workloads, every CPU stage also runs a **primes**
+kernel ported line-for-line from `cpu_execute_event` in
+[sysbench](https://github.com/akopytov/sysbench)'s `sb_cpu.c`: for each
+configured worker thread, repeatedly sweep trial-division primality checks
+over every integer `c` from 3 up to (exclusive) `--cpu-max-prime` (default
+`10000`, same default sysbench uses), computing `t = sqrt(c)` as a 64-bit
+float for each `c` and trial-dividing by every `l` from 2 up to `t` — the
+same sqrt-per-`c` cost sysbench's own loop pays, not an integer `l*l<=c`
+shortcut. One full sweep over `3..max_prime` is counted as one "event",
+matching sysbench's own definition. nsysbench reports it as `events_per_sec`
+(median of 3 samples, after a discarded warm-up, with min/max and
+coefficient of variation like the other workloads), so a `nsysbench cpu
+--cpu-max-prime N --threads T` run's `primes/s` is a same-methodology,
+same-ballpark comparison against `sysbench --cpu-max-prime=N --threads=T
+run`'s reported `events/sec` on the same machine. It won't be bit-identical
+— Rust vs. C codegen and libm `sqrt` implementations differ slightly — but
+it isolates the same algorithm and instruction mix.
+
+Unlike the three GOPS workloads, `primes` is **not** included in
+`composite_gops` or the CPU score. Its "operation" (one sweep) does a
+variable amount of work depending on `--cpu-max-prime`, unlike the other
+kernels' fixed ops-per-block constant, so mixing it into the GOPS geometric
+mean would make `composite_gops` depend on a flag instead of being a stable,
+version-to-version comparable number. It's reported as its own field
+specifically so it stays an apples-to-apples number against real sysbench
+output, not a nsysbench-specific unit.
+
 ### Coefficient of variation (stability)
 
 Each workload in a CPU stage is timed three times (after a discarded 30ms
@@ -143,7 +172,7 @@ scaling) and should be treated with more caution.
 ### `cpu` — CPU raw processing and topology scaling
 
 ```bash
-nsysbench cpu [--threads N] [--duration SECS] [--sequence]
+nsysbench cpu [--threads N] [--duration SECS] [--sequence] [--cpu-max-prime N]
 ```
 
 | Flag | Default | Meaning |
@@ -151,6 +180,7 @@ nsysbench cpu [--threads N] [--duration SECS] [--sequence]
 | `-t`, `--threads` | `0` | Worker-thread limit. `0` uses every logical CPU visible to the process (respecting `sched_getaffinity` on Linux). A positive value caps the CPUs used, in topology order. |
 | `-d`, `--duration` | `8` | Measured seconds **per stage** (or, with `--sequence`, per thread count) — not a total run time. |
 | `--sequence` | off | Run one stage per thread count, from 1 up to the selected thread limit, instead of the fixed topology checkpoints below. |
+| `--cpu-max-prime` | `10000` | Upper bound for the sysbench-compatible `primes` kernel (see [Primes kernel](#primes-kernel-sysbench-compatible)). Matches sysbench's own `--cpu-max-prime` flag and default. |
 
 **Without `--sequence`**, nsysbench first detects CPU topology (logical
 CPUs, physical cores, SMT ratio, core classes) and then runs a fixed set of
@@ -167,11 +197,12 @@ stages, each stage selecting a specific subset of CPUs:
 4. **`all-logical`** — every selected logical CPU — only added when more
    than one CPU is selected.
 
-Each stage runs the three workloads (scalar-integer, scalar-fp, simd-fp),
-each sampled three times over `--duration`, and reports composite GOPS
-(geometric mean, see Concepts), a stability warning if noisy, and — once all
-stages complete — scaling factor and parallel efficiency relative to
-`single-thread`. The overall result also reports `single_thread_score` and
+Each stage runs the three GOPS workloads (scalar-integer, scalar-fp, simd-fp)
+plus the sysbench-compatible `primes` kernel, each sampled three times over
+`--duration`, and reports composite GOPS (geometric mean of the three GOPS
+workloads only, see Concepts), the `primes` kernel's own `events_per_sec`, a
+stability warning if noisy, and — once all stages complete — scaling factor
+and parallel efficiency relative to `single-thread`. The overall result also reports `single_thread_score` and
 `multi_thread_score` (each stage's composite GOPS × 100), `smt_gain_percent`,
 `performance_efficiency_ratio`, and a headline `score` (see [CPU score
 v2](#cpu-score-v2) below).

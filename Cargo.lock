@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "nsysbench"
-version = "0.0.1"
+version = "0.0.4"
 dependencies = [
  "clap",
  "colored",

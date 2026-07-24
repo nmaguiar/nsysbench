@@ -1699,23 +1699,22 @@ fn print_report_separator() {
 fn print_suite(result: &SuiteResult) {
     println!(
         "\n{}",
-        "╔══════════════════════════════════════════════════════════════╗"
+        "╔══════════════════════════════════╗"
             .bright_blue()
             .bold()
     );
     println!(
         "{}",
-        "║                ⚡ nsysbench performance report ⚡            ║"
+        "║ ⚡nsysbench performance report ⚡║"
             .bright_blue()
             .bold()
     );
     println!(
         "{}",
-        "╚══════════════════════════════════════════════════════════════╝"
+        "╚══════════════════════════════════╝"
             .bright_blue()
             .bold()
     );
-    println!();
 
     if let Some(cpu) = &result.cpu {
         print_section(
@@ -1723,7 +1722,7 @@ fn print_suite(result: &SuiteResult) {
             cpu.score,
             &[
                 ("Single-thread score", cpu.single_thread_score),
-                ("All-logical score", cpu.multi_thread_score),
+                ("All-logical score  ", cpu.multi_thread_score),
             ],
         );
     }
@@ -1732,11 +1731,11 @@ fn print_suite(result: &SuiteResult) {
         print_section(
             "MEMORY",
             mem.score,
-            &[
-                ("Seq Write MB/s", mem.seq_write_mb_s),
-                ("Seq Read MB/s", mem.seq_read_mb_s),
-                ("Rand Write MB/s", mem.rand_write_mb_s),
-                ("Rand Read MB/s", mem.rand_read_mb_s),
+            &[    
+                ("Seq Write MB/s     ", mem.seq_write_mb_s),
+                ("Seq Read MB/s      ", mem.seq_read_mb_s),
+                ("Rand Write MB/s    ", mem.rand_write_mb_s),
+                ("Rand Read MB/s     ", mem.rand_read_mb_s),
             ],
         );
     }
@@ -1745,15 +1744,15 @@ fn print_suite(result: &SuiteResult) {
         print_section(
             "IO",
             io.score,
-            &[
-                ("Seq Write MB/s", io.seq_write_mb_s),
-                ("Seq Read MB/s", io.seq_read_mb_s),
-                ("Rand Write MB/s", io.rand_write_mb_s),
-                ("Rand Read MB/s", io.rand_read_mb_s),
-                ("Seq Write IOPS", io.seq_write_iops),
-                ("Seq Read IOPS", io.seq_read_iops),
-                ("Rand Write IOPS", io.rand_write_iops),
-                ("Rand Read IOPS", io.rand_read_iops),
+            &[ 
+                ("Seq Write MB/s     ", io.seq_write_mb_s),
+                ("Seq Read MB/s      ", io.seq_read_mb_s),
+                ("Rand Write MB/s    ", io.rand_write_mb_s),
+                ("Rand Read MB/s     ", io.rand_read_mb_s),
+                ("Seq Write IOPS     ", io.seq_write_iops),
+                ("Seq Read IOPS      ", io.seq_read_iops),
+                ("Rand Write IOPS    ", io.rand_write_iops),
+                ("Rand Read IOPS     ", io.rand_read_iops),
             ],
         );
     }
@@ -1762,10 +1761,10 @@ fn print_suite(result: &SuiteResult) {
         print_section(
             "NETWORK",
             net.score,
-            &[
-                ("Throughput MB/s", net.throughput_mb_s),
-                ("Req/s", net.requests_per_sec),
-                ("Latency ms", net.avg_latency_ms),
+            &[   
+                ("Throughput MB/s    ", net.throughput_mb_s),
+                ("Req/s              ", net.requests_per_sec),
+                ("Latency ms         ", net.avg_latency_ms),
             ],
         );
     }
@@ -1792,23 +1791,23 @@ fn print_section(name: &str, score: f64, metrics: &[(&str, f64)]) {
 }
 
 fn print_cpu(cpu: &CpuResult) {
-    println!("{}", "⚙️  CPU benchmark v2".bright_green().bold());
+    println!("{}", "⚙️  CPU benchmark  ".bright_green().bold());
     print_section(
         "CPU",
         cpu.score,
         &[
             ("Single-thread score", cpu.single_thread_score),
-            ("All-logical score", cpu.multi_thread_score),
+            ("All-logical score  ", cpu.multi_thread_score),
         ],
     );
     println!(
-        "  Logical CPUs: {}  Physical cores: {}  SMT: {}",
+        "  Logical CPUs: {} | Physical cores: {} | SMT: {}",
         cpu.topology.logical_cpus.len(),
         cpu.topology.physical_cores,
         cpu.topology.smt_threads_per_core
     );
     println!(
-        "  Placement: {}  SIMD: {}",
+        "  Placement: {} | SIMD: {}",
         cpu.capabilities.placement, cpu.capabilities.simd_path
     );
     for stage in &cpu.stages {
@@ -1860,10 +1859,10 @@ fn print_cpu_sequence(sequence: &CpuSequenceResult) {
 }
 
 fn print_system_info(info: &SystemInfo) {
-    println!("{}", "ℹ️ System performance metadata".bright_green().bold());
+    println!("{}", "ℹ️ System performance metadata  ".bright_green().bold());
     println!("\n{}", "CPU".bright_cyan().bold());
     println!(
-        "  Logical CPUs: {}  Physical cores: {}",
+        "  Logical CPUs: {} | Physical cores: {}",
         info.cpu.logical_cpus,
         info.cpu
             .physical_cores
@@ -1886,7 +1885,7 @@ fn print_system_info(info: &SystemInfo) {
         info.io.filesystem.as_deref().unwrap_or("unknown")
     );
     println!(
-        "  Capacity: {}  Available: {}",
+        "  Capacity: {} | Available: {}",
         info.io
             .total_bytes
             .map_or_else(|| "unknown".to_string(), format_bytes),
@@ -1958,46 +1957,46 @@ fn color_chart_line(line: &str) -> String {
 }
 
 fn print_memory(mem: &MemoryResult) {
-    println!("{}", "🧠 Memory benchmark".bright_green().bold());
+    println!("{}", "🧠 Memory benchmark  ".bright_green().bold());
     print_section(
         "MEMORY",
         mem.score,
-        &[
-            ("Seq Write MB/s", mem.seq_write_mb_s),
-            ("Seq Read MB/s", mem.seq_read_mb_s),
-            ("Rand Write MB/s", mem.rand_write_mb_s),
-            ("Rand Read MB/s", mem.rand_read_mb_s),
+        &[   
+            ("Seq Write MB/s     ", mem.seq_write_mb_s),
+            ("Seq Read MB/s      ", mem.seq_read_mb_s),
+            ("Rand Write MB/s    ", mem.rand_write_mb_s),
+            ("Rand Read MB/s     ", mem.rand_read_mb_s),
         ],
     );
 }
 
 fn print_io(io: &IoResult) {
-    println!("{}", "💽 IO benchmark".bright_green().bold());
+    println!("{}", "💽 IO benchmark  ".bright_green().bold());
     print_section(
         "IO",
         io.score,
-        &[
-            ("Seq Write MB/s", io.seq_write_mb_s),
-            ("Seq Read MB/s", io.seq_read_mb_s),
-            ("Rand Write MB/s", io.rand_write_mb_s),
-            ("Rand Read MB/s", io.rand_read_mb_s),
-            ("Seq Write IOPS", io.seq_write_iops),
-            ("Seq Read IOPS", io.seq_read_iops),
-            ("Rand Write IOPS", io.rand_write_iops),
-            ("Rand Read IOPS", io.rand_read_iops),
+        &[ 
+            ("Seq Write MB/s     ", io.seq_write_mb_s),
+            ("Seq Read MB/s      ", io.seq_read_mb_s),
+            ("Rand Write MB/s    ", io.rand_write_mb_s),
+            ("Rand Read MB/s     ", io.rand_read_mb_s),
+            ("Seq Write IOPS     ", io.seq_write_iops),
+            ("Seq Read IOPS      ", io.seq_read_iops),
+            ("Rand Write IOPS    ", io.rand_write_iops),
+            ("Rand Read IOPS     ", io.rand_read_iops),
         ],
     );
 }
 
 fn print_network(net: &NetworkResult) {
-    println!("{}", "🌐 Network benchmark".bright_green().bold());
+    println!("{}", "🌐 Network benchmark  ".bright_green().bold());
     print_section(
         "NETWORK",
         net.score,
-        &[
-            ("Throughput MB/s", net.throughput_mb_s),
-            ("Req/s", net.requests_per_sec),
-            ("Latency ms", net.avg_latency_ms),
+        &[ 
+            ("Throughput MB/s    ", net.throughput_mb_s),
+            ("Req/s              ", net.requests_per_sec),
+            ("Latency ms         ", net.avg_latency_ms),
         ],
     );
 }

@@ -212,8 +212,9 @@ runs one stage per thread count from 1 through the selected limit
 (`threads-1`, `threads-2`, ...), each for the same `--duration`. This is the
 "expensive full scaling diagnostic" mentioned in the README — it directly
 shows the scaling curve rather than a handful of checkpoints. Normal
-(non-JSON) output renders this as five-row UTF-8 sparklines of composite GOPS
-and primes/s vs. thread count; JSON output includes every individual stage's
+(non-JSON) output renders this as ten-row UTF-8 sparklines of composite GOPS
+and primes/s vs. thread count. Each row uses partial block characters for
+eighth-row increments (80 display levels total); JSON output includes every individual stage's
 full result.
 
 ### `memory` — memory raw speed

@@ -2000,8 +2000,11 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn sparkline(values: &[f64]) -> String {
-    const HEIGHT: usize = 5;
+    const HEIGHT: usize = 10;
+    const SUBROWS_PER_ROW: usize = 8;
     const COLUMN_GAP: &str = "┄┄┄";
+    const PARTIAL_BLOCKS: [char; SUBROWS_PER_ROW + 1] =
+        ['┄', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
     let Some(&max) = values
         .iter()
@@ -2018,9 +2021,9 @@ fn sparkline(values: &[f64]) -> String {
             if max <= 0.0 || !value.is_finite() {
                 0
             } else {
-                ((value / max) * HEIGHT as f64)
+                ((value / max) * (HEIGHT * SUBROWS_PER_ROW) as f64)
                     .round()
-                    .clamp(1.0, HEIGHT as f64) as usize
+                    .clamp(1.0, (HEIGHT * SUBROWS_PER_ROW) as f64) as usize
             }
         })
         .collect();
@@ -2030,7 +2033,10 @@ fn sparkline(values: &[f64]) -> String {
         lines.push(
             heights
                 .iter()
-                .map(|height| if *height >= row { "█" } else { "┄" }.to_string())
+                .map(|height| {
+                    let filled_subrows = height.saturating_sub((row - 1) * SUBROWS_PER_ROW);
+                    PARTIAL_BLOCKS[filled_subrows.min(SUBROWS_PER_ROW)].to_string()
+                })
                 .collect::<Vec<_>>()
                 .join(COLUMN_GAP),
         );
@@ -2049,7 +2055,7 @@ fn sparkline(values: &[f64]) -> String {
 fn color_chart_line(line: &str) -> String {
     line.chars()
         .map(|character| match character {
-            '█' => character.to_string().bright_cyan().to_string(),
+            '▁'..='█' => character.to_string().bright_cyan().to_string(),
             '┄' => character.to_string().bright_black().to_string(),
             _ => character.to_string(),
         })
@@ -2123,16 +2129,18 @@ mod tests {
     }
 
     #[test]
-    fn sparkline_is_five_rows_with_dotted_grid_and_spaced_thread_labels() {
+    fn sparkline_is_ten_rows_with_high_resolution_blocks_and_spaced_thread_labels() {
         let chart = sparkline(&[10.0, 20.0, 30.0]);
         let lines: Vec<_> = chart.lines().collect();
-        assert_eq!(lines.len(), 6);
+        assert_eq!(lines.len(), 11);
         assert_eq!(lines.last(), Some(&"1   2   3"));
         assert_eq!(lines[0], "┄┄┄┄┄┄┄┄█");
-        assert_eq!(lines[4], "█┄┄┄█┄┄┄█");
+        assert_eq!(lines[3], "┄┄┄┄▅┄┄┄█");
+        assert_eq!(lines[6], "▃┄┄┄█┄┄┄█");
+        assert_eq!(lines[9], "█┄┄┄█┄┄┄█");
 
         let ten_threads = sparkline(&(1..=10).map(f64::from).collect::<Vec<_>>());
-        assert!(ten_threads.lines().take(5).all(|line| !line.contains(' ')));
+        assert!(ten_threads.lines().take(10).all(|line| !line.contains(' ')));
     }
 
     #[test]

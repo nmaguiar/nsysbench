@@ -51,7 +51,7 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
-        run: cargo build --locked --release --target "${{ matrix.target }}"
+        run: cargo build --release --target "${{ matrix.target }}"
       - name: Package binary
         id: package
         shell: bash
